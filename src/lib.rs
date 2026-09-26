@@ -1,0 +1,55 @@
+pub mod audio;
+pub mod capture;
+pub mod chapters;
+pub mod controls;
+pub mod devices;
+pub mod edit;
+pub mod error;
+pub mod format;
+pub mod lang;
+pub mod metadata;
+pub mod playback;
+pub mod streaming;
+pub mod subtitles;
+pub mod thumbnails;
+
+pub use audio::{is_system_muted, set_system_muted, set_system_volume, system_volume};
+pub use capture::{list_cameras, snapshot, start_capture, CameraDevice, CameraKind, CaptureFormat, CaptureQuality};
+pub use chapters::{read_chapters, Chapter, ChapterList};
+pub use controls::{transport_bar, ControlDescriptor, ControlIcon};
+pub use devices::{available_cameras, available_outputs, VideoOutput};
+pub use edit::{concat, transcode, trim, ExportPreset};
+pub use error::{MediaError, Result};
+pub use format::{is_supported, probe_container, VideoContainer, SUPPORTED_EXTENSIONS};
+pub use metadata::{read_metadata, VideoMetadata};
+pub use playback::{DisplayMode, PlaybackState, VideoPlayer, MAX_SPEED, MIN_SPEED};
+pub use streaming::{detect_kind, fetch_hls_playlist, fetch_progressive, fetch_segment, BufferState, HlsPlaylist, StreamEvent, StreamKind};
+pub use subtitles::{SubtitleCue, SubtitleTrack};
+pub use thumbnails::{extract_args, extract_frame};
+
+/// Shared handle to the video domains (mirrors NetworkKit/AudioKit facades).
+#[derive(Debug, Default)]
+pub struct MediaKit {
+    pub player: VideoPlayer,
+}
+
+impl MediaKit {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn player_mut(&mut self) -> &mut VideoPlayer {
+        &mut self.player
+    }
+
+    pub fn player(&self) -> &VideoPlayer {
+        &self.player
+    }
+}
+
+/// Library version string.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+mod ffi;
