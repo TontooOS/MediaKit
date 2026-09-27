@@ -156,6 +156,37 @@ pub fn transcode_prores(
     }
 }
 
+/// Losslessly trims a single-track `.mov` to `[start_secs, end_secs)`
+/// with pure Rust (no ffmpeg): sample tables and durations are
+/// rewritten, frame bytes are copied. Supports uniform or indexed
+/// `stsz`, `stco`/`co64`, optional `stss`/`ctts`; multi-track files,
+/// edit lists and compact sample tables return `ParseError`.
+pub fn trim_mov_native(
+    input: &Path,
+    start_secs: f64,
+    end_secs: f64,
+    output: &Path,
+) -> Result<()> {
+    if start_secs < 0.0 || end_secs <= start_secs {
+        return Err(MediaError::InvalidSeek(format!(
+            "{start_secs}-{end_secs}"
+        )));
+    }
+    crate::format::probe_container(input)?;
+    let out_ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !crate::mov::is_mov_extension(&out_ext) {
+        return Err(MediaError::UnsupportedFormat(out_ext));
+    }
+    let data = std::fs::read(input).map_err(MediaError::from_io)?;
+    let trimmed = crate::mov::trim_mov_bytes(&data, start_secs, end_secs)?;
+    std::fs::write(output, trimmed).map_err(MediaError::from_io)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

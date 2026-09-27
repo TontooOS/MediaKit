@@ -43,5 +43,6 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: Native lossless `.mov` trim (`trim_mov_native`), raw `.mov` writer (`build_raw_mov`).
 - 2026-09-27: Native `.mov`/ProRes support (`mov`, `prores`, `transcode_prores`, FFI).
 - 2026-09-26: Initial wiki with Playback, Capture, Streaming, Metadata, Thumbnails, Editing, Devices, Controls, Ffi and Localization pages.

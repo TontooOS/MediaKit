@@ -508,6 +508,1031 @@ pub fn read_mov_metadata(path: &Path) -> Result<VideoMetadata> {
     Ok(mov_to_metadata(&info, path))
 }
 
+// ---------- Native sample tables, raw writer and lossless trim ----------
+
+/// Hard cap for whole-file reads in the native trim path.
+pub const MAX_MOV_FILE_SIZE: usize = 512 * 1024 * 1024;
+/// Sanity cap for expanded sample counts.
+const MAX_SAMPLES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Span {
+    start: usize,
+    end: usize,
+    header: usize,
+}
+
+impl Span {
+    fn content_range(&self) -> (usize, usize) {
+        (self.start + self.header, self.end)
+    }
+}
+
+fn parse_error(msg: &str) -> MediaError {
+    MediaError::ParseError(msg.into())
+}
+
+fn be32(data: &[u8], off: usize) -> Result<u32> {
+    data.get(off..off + 4)
+        .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+        .ok_or_else(|| parse_error("truncated box"))
+}
+
+fn be64(data: &[u8], off: usize) -> Result<u64> {
+    data.get(off..off + 8)
+        .map(|s| {
+            u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        })
+        .ok_or_else(|| parse_error("truncated box"))
+}
+
+fn scan_children(data: &[u8]) -> Result<Vec<([u8; 4], Span)>> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= data.len() {
+        if out.len() > 4096 {
+            return Err(parse_error("too many boxes"));
+        }
+        let s32 = be32(data, off)? as u64;
+        let typ = [data[off + 4], data[off + 5], data[off + 6], data[off + 7]];
+        let (size, header) = if s32 == 1 {
+            (be64(data, off + 8)?, 16usize)
+        } else if s32 == 0 {
+            ((data.len() - off) as u64, 8usize)
+        } else {
+            (s32, 8usize)
+        };
+        if size < header as u64 || off + size as usize > data.len() {
+            return Err(parse_error("invalid child box"));
+        }
+        out.push((
+            typ,
+            Span {
+                start: off,
+                end: off + size as usize,
+                header,
+            },
+        ));
+        off += size as usize;
+    }
+    Ok(out)
+}
+
+fn find_child(kids: &[([u8; 4], Span)], want: &[u8; 4]) -> Option<Span> {
+    kids.iter().find(|(t, _)| t == want).map(|(_, s)| *s)
+}
+
+fn make_box(typ: &[u8; 4], payload: &[u8]) -> Result<Vec<u8>> {
+    let size = payload.len() as u64 + 8;
+    if size > u32::MAX as u64 {
+        return Err(parse_error("box too large"));
+    }
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&(size as u32).to_be_bytes());
+    out.extend_from_slice(typ);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// Rebuilds a box payload, replacing listed children and copying the
+/// rest verbatim (sizes re-serialized bottom-up by the caller).
+fn splice(payload: &[u8], replacements: &[([u8; 4], Vec<u8>)]) -> Result<Vec<u8>> {
+    let kids = scan_children(payload)?;
+    let mut out = Vec::new();
+    for (typ, span) in kids {
+        match replacements.iter().find(|(t, _)| t == &typ) {
+            Some((_, replacement)) => out.extend_from_slice(replacement),
+            None => out.extend_from_slice(&payload[span.start..span.end]),
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Default)]
+struct SttsRun {
+    count: u32,
+    delta: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedTrak {
+    tkhd: Span,
+    tkhd_version: u8,
+    mdhd: Span,
+    mdhd_version: u8,
+    media_timescale: u32,
+    stbl: Span,
+    stsd_box: Vec<u8>,
+    stts: Vec<SttsRun>,
+    stsc: Vec<(u32, u32, u32)>,
+    stsz_uniform: u32,
+    stsz_table: Vec<u32>,
+    chunk_offsets_64: bool,
+    chunk_offsets: Vec<u64>,
+    stss: Option<Vec<u32>>,
+    ctts_version: Option<u8>,
+    ctts: Vec<(u32, i64)>,
+    video_fourcc: String,
+    stbl_kids: Vec<([u8; 4], Span)>,
+}
+
+fn parse_stts_body(body: &[u8]) -> Result<Vec<SttsRun>> {
+    if body.len() < 8 {
+        return Err(parse_error("truncated stts"));
+    }
+    let count = be32(body, 4)? as usize;
+    if count > 65536 {
+        return Err(parse_error("stts run count insane"));
+    }
+    let mut runs = Vec::with_capacity(count.min(1024));
+    let mut off = 8usize;
+    for _ in 0..count {
+        if off + 8 > body.len() {
+            return Err(parse_error("truncated stts run"));
+        }
+        runs.push(SttsRun {
+            count: be32(body, off)?,
+            delta: be32(body, off + 4)?,
+        });
+        off += 8;
+    }
+    Ok(runs)
+}
+
+fn parse_stsc_body(body: &[u8]) -> Result<Vec<(u32, u32, u32)>> {
+    if body.len() < 8 {
+        return Err(parse_error("truncated stsc"));
+    }
+    let count = be32(body, 4)? as usize;
+    if count > 65536 {
+        return Err(parse_error("stsc entry count insane"));
+    }
+    let mut out = Vec::with_capacity(count.min(1024));
+    let mut off = 8usize;
+    for _ in 0..count {
+        if off + 12 > body.len() {
+            return Err(parse_error("truncated stsc entry"));
+        }
+        out.push((be32(body, off)?, be32(body, off + 4)?, be32(body, off + 8)?));
+        off += 12;
+    }
+    if out.is_empty() || out[0].0 != 1 {
+        return Err(parse_error("stsc must start at chunk 1"));
+    }
+    Ok(out)
+}
+
+fn parse_stsz_body(body: &[u8]) -> Result<(u32, Vec<u32>)> {
+    if body.len() < 12 {
+        return Err(parse_error("truncated stsz"));
+    }
+    let uniform = be32(body, 4)?;
+    let count = be32(body, 8)? as usize;
+    if count > MAX_SAMPLES {
+        return Err(parse_error("sample count insane"));
+    }
+    if uniform != 0 {
+        return Ok((uniform, Vec::new()));
+    }
+    if body.len() < 12 + count * 4 {
+        return Err(parse_error("truncated stsz table"));
+    }
+    let mut table = Vec::with_capacity(count.min(1 << 20));
+    for i in 0..count {
+        table.push(be32(body, 12 + i * 4)?);
+    }
+    Ok((0, table))
+}
+
+fn parse_offset_table(body: &[u8], wide: bool) -> Result<Vec<u64>> {
+    if body.len() < 8 {
+        return Err(parse_error("truncated chunk offset table"));
+    }
+    let count = be32(body, 4)? as usize;
+    if count == 0 || count > MAX_SAMPLES {
+        return Err(parse_error("chunk count insane"));
+    }
+    let stride = if wide { 8 } else { 4 };
+    if body.len() < 8 + count * stride {
+        return Err(parse_error("truncated chunk offsets"));
+    }
+    let mut out = Vec::with_capacity(count.min(1 << 20));
+    for i in 0..count {
+        out.push(if wide {
+            be64(body, 8 + i * 8)?
+        } else {
+            be32(body, 8 + i * 4)? as u64
+        });
+    }
+    Ok(out)
+}
+
+fn parse_stss_body(body: &[u8]) -> Result<Vec<u32>> {
+    if body.len() < 8 {
+        return Err(parse_error("truncated stss"));
+    }
+    let count = be32(body, 4)? as usize;
+    if count > MAX_SAMPLES {
+        return Err(parse_error("sync sample count insane"));
+    }
+    if body.len() < 8 + count * 4 {
+        return Err(parse_error("truncated stss table"));
+    }
+    (0..count)
+        .map(|i| be32(body, 8 + i * 4))
+        .collect()
+}
+
+fn parse_ctts_body(body: &[u8]) -> Result<(u8, Vec<(u32, i64)>)> {
+    if body.len() < 8 {
+        return Err(parse_error("truncated ctts"));
+    }
+    let version = body[0];
+    if version > 1 {
+        return Err(parse_error("unsupported ctts version"));
+    }
+    let count = be32(body, 4)? as usize;
+    if count > 65536 {
+        return Err(parse_error("ctts run count insane"));
+    }
+    let mut runs = Vec::with_capacity(count.min(1024));
+    let mut off = 8usize;
+    for _ in 0..count {
+        if off + 8 > body.len() {
+            return Err(parse_error("truncated ctts run"));
+        }
+        let n = be32(body, off)?;
+        let offset = if version == 1 {
+            i32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]])
+                as i64
+        } else {
+            be32(body, off + 4)? as i64
+        };
+        runs.push((n, offset));
+        off += 8;
+    }
+    Ok((version, runs))
+}
+
+fn expand_runs_u32(runs: &[SttsRun], total: usize) -> Result<Vec<u32>> {
+    let mut out = Vec::with_capacity(total);
+    for run in runs {
+        if run.count as usize > MAX_SAMPLES || run.delta == 0 {
+            return Err(parse_error("bad stts run"));
+        }
+        for _ in 0..run.count {
+            out.push(run.delta);
+            if out.len() > total {
+                return Err(parse_error("stts overruns sample count"));
+            }
+        }
+    }
+    if out.len() != total {
+        return Err(parse_error("stts/sample count mismatch"));
+    }
+    Ok(out)
+}
+
+fn repack_runs_u32(values: &[u32]) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &v in values {
+        if let Some(last) = runs.last_mut() {
+            if last.1 == v {
+                last.0 += 1;
+                continue;
+            }
+        }
+        runs.push((1u32, v));
+    }
+    runs
+}
+
+fn repack_runs_i64(values: &[i64]) -> Vec<(u32, i64)> {
+    let mut runs: Vec<(u32, i64)> = Vec::new();
+    for &v in values {
+        if let Some(last) = runs.last_mut() {
+            if last.1 == v {
+                last.0 += 1;
+                continue;
+            }
+        }
+        runs.push((1, v));
+    }
+    runs
+}
+
+fn expand_ctts(runs: &[(u32, i64)], total: usize) -> Result<Vec<i64>> {
+    let mut out = Vec::with_capacity(total);
+    for (n, v) in runs {
+        for _ in 0..*n {
+            out.push(*v);
+            if out.len() > total {
+                return Err(parse_error("ctts overruns sample count"));
+            }
+        }
+    }
+    if out.len() != total {
+        return Err(parse_error("ctts/sample count mismatch"));
+    }
+    Ok(out)
+}
+
+/// Shifts a span found inside `parent` (content range) to `moov` space.
+fn abs_span(parent_content_start: usize, rel: Span) -> Span {
+    Span {
+        start: parent_content_start + rel.start,
+        end: parent_content_start + rel.end,
+        header: rel.header,
+    }
+}
+
+fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
+    // All spans stored in ParsedTrak are moov-absolute.
+    let (cs, ce) = trak_span.content_range();
+    let trak = &moov[cs..ce];
+    let kids = scan_children(trak)?;
+    if kids.iter().any(|(t, _)| t == b"edts") {
+        return Err(parse_error("edit lists unsupported in native trim"));
+    }
+    let tkhd = abs_span(
+        cs,
+        find_child(&kids, b"tkhd").ok_or_else(|| parse_error("trak missing tkhd"))?,
+    );
+    let mdia_abs = abs_span(
+        cs,
+        find_child(&kids, b"mdia").ok_or_else(|| parse_error("trak missing mdia"))?,
+    );
+    let (ms, me) = mdia_abs.content_range();
+    let mdia = &moov[ms..me];
+    let mdia_kids = scan_children(mdia)?;
+    let mdhd = abs_span(
+        ms,
+        find_child(&mdia_kids, b"mdhd").ok_or_else(|| parse_error("mdia missing mdhd"))?,
+    );
+    let hdlr = find_child(&mdia_kids, b"hdlr").ok_or_else(|| parse_error("mdia missing hdlr"))?;
+    let (hs, he) = hdlr.content_range();
+    if he - hs < 12 {
+        return Err(parse_error("truncated hdlr"));
+    }
+    let handler = fourcc(&mdia[hs + 8..hs + 12]).trim().to_string();
+    if handler != "vide" {
+        return Err(parse_error("native trim supports one video track only"));
+    }
+    let minf_abs = abs_span(
+        ms,
+        find_child(&mdia_kids, b"minf").ok_or_else(|| parse_error("mdia missing minf"))?,
+    );
+    let (ns, ne) = minf_abs.content_range();
+    let minf = &moov[ns..ne];
+    let minf_kids = scan_children(minf)?;
+    let stbl_abs = abs_span(
+        ns,
+        find_child(&minf_kids, b"stbl").ok_or_else(|| parse_error("minf missing stbl"))?,
+    );
+    let (ss, se) = stbl_abs.content_range();
+    let stbl = &moov[ss..se];
+    let stbl_kids = scan_children(stbl)?;
+    if stbl_kids.iter().any(|(t, _)| t == b"stz2") {
+        return Err(parse_error("compact sample sizes unsupported"));
+    }
+    let get = |name: &[u8; 4]| -> Result<Span> {
+        find_child(&stbl_kids, name)
+            .map(|s| abs_span(ss, s))
+            .ok_or_else(|| parse_error("stbl missing box"))
+    };
+    let stsd_span = get(b"stsd")?;
+    let (ts, te) = stsd_span.content_range();
+    let stsd_box = moov[ts..te].to_vec();
+    // Video fourcc = first sample entry.
+    let mut video_fourcc = String::new();
+    if stsd_box.len() >= 16 {
+        video_fourcc = fourcc(&stsd_box[12..16]);
+    }
+    let stbl_kids_abs: Vec<([u8; 4], Span)> = stbl_kids
+        .iter()
+        .map(|(t, s)| (*t, abs_span(ss, *s)))
+        .collect();
+    let body_of = |name: &[u8; 4]| -> Result<Vec<u8>> {
+        let s = stbl_kids_abs
+            .iter()
+            .find(|(t, _)| t == name)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| parse_error("stbl missing box"))?;
+        let (a, b) = s.content_range();
+        Ok(moov[a..b].to_vec())
+    };
+    let stts = parse_stts_body(&body_of(b"stts")?)?;
+    let stsc = parse_stsc_body(&body_of(b"stsc")?)?;
+    let (stsz_uniform, stsz_table) = parse_stsz_body(&body_of(b"stsz")?)?;
+    let has_stco = stbl_kids_abs.iter().any(|(t, _)| t == b"stco");
+    let has_co64 = stbl_kids_abs.iter().any(|(t, _)| t == b"co64");
+    let (wide, off_body) = match (has_stco, has_co64) {
+        (true, false) => (false, body_of(b"stco")?),
+        (false, true) => (true, body_of(b"co64")?),
+        _ => return Err(parse_error("need exactly one stco/co64")),
+    };
+    let chunk_offsets = parse_offset_table(&off_body, wide)?;
+    let stss = match stbl_kids_abs.iter().find(|(t, _)| t == b"stss") {
+        Some((_, s)) => {
+            let (a, b) = s.content_range();
+            Some(parse_stss_body(&moov[a..b])?)
+        }
+        None => None,
+    };
+    let (ctts_version, ctts) = match stbl_kids_abs.iter().find(|(t, _)| t == b"ctts") {
+        Some((_, s)) => {
+            let (a, b) = s.content_range();
+            let (v, runs) = parse_ctts_body(&moov[a..b])?;
+            (Some(v), runs)
+        }
+        None => (None, Vec::new()),
+    };
+    let (ts, te) = tkhd.content_range();
+    let tkhd_body = &moov[ts..te];
+    if tkhd_body.is_empty() {
+        return Err(parse_error("truncated tkhd"));
+    }
+    let (ts, te) = mdhd.content_range();
+    let mdhd_body = &moov[ts..te];
+    if mdhd_body.len() < 16 {
+        return Err(parse_error("truncated mdhd"));
+    }
+    let mdhd_version = mdhd_body[0];
+    let media_timescale = if mdhd_version == 1 {
+        be32(mdhd_body, 20)?
+    } else {
+        be32(mdhd_body, 12)?
+    };
+    if media_timescale == 0 {
+        return Err(parse_error("null media timescale"));
+    }
+    Ok(ParsedTrak {
+        tkhd,
+        tkhd_version: tkhd_body[0],
+        mdhd,
+        mdhd_version,
+        media_timescale,
+        stbl: stbl_abs,
+        stsd_box,
+        stts,
+        stsc,
+        stsz_uniform,
+        stsz_table,
+        chunk_offsets_64: wide,
+        chunk_offsets,
+        stss,
+        ctts_version,
+        ctts,
+        video_fourcc,
+        stbl_kids: stbl_kids_abs,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ExpandedSamples {
+    offsets: Vec<u64>,
+    sizes: Vec<u32>,
+    deltas: Vec<u32>,
+}
+
+fn expand_samples(trak: &ParsedTrak) -> Result<ExpandedSamples> {
+    let chunks = trak.chunk_offsets.len();
+    // Map each chunk to its stsc entry.
+    let mut total = 0usize;
+    let mut per_chunk = Vec::with_capacity(chunks);
+    for c in 1..=chunks as u32 {
+        let mut entry = &trak.stsc[0];
+        for e in &trak.stsc {
+            if e.0 <= c {
+                entry = e;
+            } else {
+                break;
+            }
+        }
+        if entry.1 == 0 || entry.1 as usize > MAX_SAMPLES {
+            return Err(parse_error("bad stsc samples-per-chunk"));
+        }
+        per_chunk.push(entry.1 as usize);
+        total = total
+            .checked_add(entry.1 as usize)
+            .ok_or_else(|| parse_error("sample count overflow"))?;
+    }
+    if total == 0 || total > MAX_SAMPLES {
+        return Err(parse_error("sample count insane"));
+    }
+    let sizes: Vec<u32> = if trak.stsz_uniform != 0 {
+        vec![trak.stsz_uniform; total]
+    } else {
+        if trak.stsz_table.len() != total {
+            return Err(parse_error("stsz/sample count mismatch"));
+        }
+        trak.stsz_table.clone()
+    };
+    let deltas = expand_runs_u32(&trak.stts, total)?;
+    let mut offsets = Vec::with_capacity(total);
+    let mut sizes_out = Vec::with_capacity(total);
+    let mut global = 0usize;
+    for (c, &n) in per_chunk.iter().enumerate() {
+        let mut pos = trak.chunk_offsets[c];
+        for _ in 0..n {
+            if global >= total {
+                return Err(parse_error("stsc overruns samples"));
+            }
+            offsets.push(pos);
+            sizes_out.push(sizes[global]);
+            pos += sizes[global] as u64;
+            global += 1;
+        }
+    }
+    if global != total {
+        return Err(parse_error("chunk/sample count mismatch"));
+    }
+    Ok(ExpandedSamples {
+        offsets,
+        sizes: sizes_out,
+        deltas,
+    })
+}
+
+fn patch_u32(content: &mut [u8], off: usize, value: u32) -> Result<()> {
+    if content.len() < off + 4 {
+        return Err(parse_error("duration patch out of range"));
+    }
+    content[off..off + 4].copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn patch_u64(content: &mut [u8], off: usize, value: u64) -> Result<()> {
+    if content.len() < off + 8 {
+        return Err(parse_error("duration patch out of range"));
+    }
+    content[off..off + 8].copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn checked_u32(value: u64, what: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| parse_error(what))
+}
+
+/// Lossless native trim of a single-track `.mov`: selects samples in
+/// `[start_secs, end_secs)`, rewrites sample tables and durations, and
+/// returns the new file bytes (ftyp + moov + single mdat, faststart
+/// order). No ffmpeg involved.
+pub(crate) fn trim_mov_bytes(data: &[u8], start_secs: f64, end_secs: f64) -> Result<Vec<u8>> {
+    if data.len() > MAX_MOV_FILE_SIZE {
+        return Err(parse_error("file too large for native trim"));
+    }
+    let top = scan_children(data)?;
+    let ftyp = top
+        .iter()
+        .find(|(t, _)| t == b"ftyp")
+        .map(|(_, s)| *s)
+        .ok_or_else(|| parse_error("missing ftyp"))?;
+    let moov_span = top
+        .iter()
+        .find(|(t, _)| t == b"moov")
+        .map(|(_, s)| *s)
+        .ok_or_else(|| parse_error("missing moov"))?;
+    let mdats: Vec<Span> = top.iter().filter(|(t, _)| t == b"mdat").map(|(_, s)| *s).collect();
+    if mdats.len() != 1 {
+        return Err(parse_error("native trim needs exactly one mdat"));
+    }
+    let (ms, me) = moov_span.content_range();
+    let moov = &data[ms..me];
+    let moov_kids = scan_children(moov)?;
+    let mvhd_span =
+        find_child(&moov_kids, b"mvhd").ok_or_else(|| parse_error("moov missing mvhd"))?;
+    let (vs, ve) = mvhd_span.content_range();
+    let mvhd_body = &moov[vs..ve];
+    if mvhd_body.len() < 20 {
+        return Err(parse_error("truncated mvhd"));
+    }
+    let mvhd_version = mvhd_body[0];
+    let movie_timescale = if mvhd_version == 1 {
+        be32(mvhd_body, 20)?
+    } else {
+        be32(mvhd_body, 12)?
+    };
+    if movie_timescale == 0 {
+        return Err(parse_error("null movie timescale"));
+    }
+    let trak_spans: Vec<Span> = moov_kids
+        .iter()
+        .filter(|(t, _)| t == b"trak")
+        .map(|(_, s)| *s)
+        .collect();
+    if trak_spans.len() != 1 {
+        return Err(parse_error("native trim supports one track only"));
+    }
+    // scan_children ran on the moov content, so spans are already
+    // moov-relative.
+    let trak_rel = trak_spans[0];
+    let trak = parse_trak_tables(moov, trak_rel)?;
+    let samples = expand_samples(&trak)?;
+    let media_ts = trak.media_timescale as f64;
+    let s_ts = (start_secs * media_ts).round() as u64;
+    let e_ts = (end_secs * media_ts).round() as u64;
+    let mut time = 0u64;
+    let mut selected: Vec<usize> = Vec::new();
+    for (i, &delta) in samples.deltas.iter().enumerate() {
+        if time >= s_ts && time < e_ts {
+            selected.push(i);
+        }
+        time += delta as u64;
+    }
+    if selected.is_empty() {
+        return Err(MediaError::InvalidSeek(format!("{start_secs}-{end_secs}")));
+    }
+    let n = selected.len();
+    let new_deltas: Vec<u32> = selected.iter().map(|&i| samples.deltas[i]).collect();
+    let new_sizes: Vec<u32> = selected.iter().map(|&i| samples.sizes[i]).collect();
+    let media_duration: u64 = new_deltas.iter().map(|&d| d as u64).sum();
+    let movie_duration =
+        ((media_duration as u128 * movie_timescale as u128 + trak.media_timescale as u128 / 2)
+            / trak.media_timescale as u128) as u64;
+    // Copy selected sample bytes.
+    let (ds, de) = mdats[0].content_range();
+    let mdat = &data[ds..de];
+    let mdat_base = ds as u64;
+    let mut new_mdat = Vec::new();
+    for &i in &selected {
+        let off = samples.offsets[i]
+            .checked_sub(mdat_base)
+            .ok_or_else(|| parse_error("sample outside mdat"))? as usize;
+        let size = samples.sizes[i] as usize;
+        if off + size > mdat.len() {
+            return Err(parse_error("sample overruns mdat"));
+        }
+        new_mdat.extend_from_slice(&mdat[off..off + size]);
+    }
+    // ctts slice.
+    let new_ctts: Option<(u8, Vec<(u32, i64)>)> = match trak.ctts_version {
+        Some(v) => {
+            let expanded = expand_ctts(&trak.ctts, samples.deltas.len())?;
+            let sliced: Vec<i64> = selected.iter().map(|&i| expanded[i]).collect();
+            Some((v, repack_runs_i64(&sliced)))
+        }
+        None => None,
+    };
+    // stss remap (1-based).
+    let new_stss: Option<Vec<u32>> = trak.stss.as_ref().map(|sync| {
+        let set: std::collections::HashSet<u32> = sync.iter().copied().collect();
+        selected
+            .iter()
+            .enumerate()
+            .filter(|(_, &orig)| set.contains(&(orig as u32 + 1)))
+            .map(|(pos, _)| pos as u32 + 1)
+            .collect()
+    });
+    // stts rebuild.
+    let mut stts_payload = vec![0u8; 8];
+    let stts_runs = repack_runs_u32(&new_deltas);
+    stts_payload[4..8].copy_from_slice(&(stts_runs.len() as u32).to_be_bytes());
+    for (count, delta) in &stts_runs {
+        stts_payload.extend_from_slice(&count.to_be_bytes());
+        stts_payload.extend_from_slice(&delta.to_be_bytes());
+    }
+    let new_stts = make_box(b"stts", &stts_payload)?;
+    // stsc single chunk.
+    let desc_id = trak.stsc[0].2;
+    let mut stsc_payload = vec![0u8; 8];
+    stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&(n as u32).to_be_bytes());
+    stsc_payload.extend_from_slice(&desc_id.to_be_bytes());
+    let new_stsc = make_box(b"stsc", &stsc_payload)?;
+    // stsz uniform when possible.
+    let uniform = new_sizes.iter().all(|&s| s == new_sizes[0]);
+    let mut stsz_payload = vec![0u8; 12];
+    if uniform {
+        stsz_payload[4..8].copy_from_slice(&new_sizes[0].to_be_bytes());
+        stsz_payload[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+    } else {
+        stsz_payload[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+        for &s in &new_sizes {
+            stsz_payload.extend_from_slice(&s.to_be_bytes());
+        }
+    }
+    let new_stsz = make_box(b"stsz", &stsz_payload)?;
+    // stss rebuild.
+    let mut new_stss_box: Option<Vec<u8>> = None;
+    if let Some(remapped) = &new_stss {
+        let mut payload = vec![0u8; 8];
+        payload[4..8].copy_from_slice(&(remapped.len() as u32).to_be_bytes());
+        for &s in remapped {
+            payload.extend_from_slice(&s.to_be_bytes());
+        }
+        new_stss_box = Some(make_box(b"stss", &payload)?);
+    }
+    // ctts rebuild.
+    let mut new_ctts_box: Option<Vec<u8>> = None;
+    if let Some((version, runs)) = &new_ctts {
+        let mut payload = vec![*version, 0, 0, 0];
+        payload.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+        for (count, offset) in runs {
+            payload.extend_from_slice(&count.to_be_bytes());
+            if *version == 1 {
+                payload.extend_from_slice(&(*offset as i32).to_be_bytes());
+            } else {
+                payload.extend_from_slice(&(*offset as u32).to_be_bytes());
+            }
+        }
+        new_ctts_box = Some(make_box(b"ctts", &payload)?);
+    }
+/// Builds the single-entry `stco`/`co64` box for the new chunk offset.
+fn chunk_offset_box(wide: bool, chunk_offset: u64) -> Result<Vec<u8>> {
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    if wide {
+        payload.extend_from_slice(&chunk_offset.to_be_bytes());
+        make_box(b"co64", &payload)
+    } else {
+        payload.extend_from_slice(
+            &checked_u32(chunk_offset, "mdat offset overflow")?.to_be_bytes(),
+        );
+        make_box(b"stco", &payload)
+    }
+}
+    // Resolve the mdia/minf box spans as moov-absolute box spans
+    // (content_range adds the header, so never re-wrap its output).
+    let (tcs, tce) = trak_rel.content_range();
+    let trak_bytes = &moov[tcs..tce];
+    let trak_kids = scan_children(trak_bytes)?;
+    let mdia_box = find_child(&trak_kids, b"mdia").ok_or_else(|| parse_error("trak missing mdia"))?;
+    let mdia_abs = Span {
+        start: tcs + mdia_box.start,
+        end: tcs + mdia_box.end,
+        header: mdia_box.header,
+    };
+    let (mdcs, mdce) = mdia_abs.content_range();
+    let mdia_bytes = &moov[mdcs..mdce];
+    let mdia_kids = scan_children(mdia_bytes)?;
+    let minf_box = find_child(&mdia_kids, b"minf").ok_or_else(|| parse_error("mdia missing minf"))?;
+    let minf_abs = Span {
+        start: mdcs + minf_box.start,
+        end: mdcs + minf_box.end,
+        header: minf_box.header,
+    };
+    // Patched copies of the moov payload for duration fields.
+    let mut patched = moov.to_vec();
+    {
+        let (s, e) = mvhd_span.content_range();
+        let body = &mut patched[s..e];
+        if mvhd_version == 1 {
+            patch_u64(body, 24, movie_duration)?;
+        } else {
+            patch_u32(body, 16, checked_u32(movie_duration, "movie duration overflow")?)?;
+        }
+    }
+    {
+        let (s, e) = trak.mdhd.content_range();
+        let body = &mut patched[s..e];
+        if trak.mdhd_version == 1 {
+            patch_u64(body, 24, media_duration)?;
+        } else {
+            patch_u32(body, 16, checked_u32(media_duration, "media duration overflow")?)?;
+        }
+    }
+    {
+        let (s, e) = trak.tkhd.content_range();
+        let body = &mut patched[s..e];
+        if trak.tkhd_version == 1 {
+            patch_u64(body, 28, movie_duration)?;
+        } else {
+            patch_u32(body, 20, checked_u32(movie_duration, "track duration overflow")?)?;
+        }
+    }
+    // Shared stbl replacements (offset box filled per pass).
+    let stbl_base: Vec<([u8; 4], Vec<u8>)> = {
+        let mut repl: Vec<([u8; 4], Vec<u8>)> = vec![
+            (*b"stts", new_stts),
+            (*b"stsc", new_stsc),
+            (*b"stsz", new_stsz),
+        ];
+        if let Some(b) = new_stss_box {
+            repl.push((*b"stss", b));
+        }
+        if let Some(b) = new_ctts_box {
+            repl.push((*b"ctts", b));
+        }
+        repl
+    };
+    let off_name = if trak.chunk_offsets_64 { *b"co64" } else { *b"stco" };
+    let build_stbl = |chunk_offset: u64| -> Result<Vec<u8>> {
+        let mut repl = stbl_base.clone();
+        repl.push((off_name, chunk_offset_box(trak.chunk_offsets_64, chunk_offset)?));
+        let (ss, se) = trak.stbl.content_range();
+        // stbl carries no duration fields; `patched` copy is identical.
+        let payload = splice(&patched[ss..se], &repl)?;
+        make_box(b"stbl", &payload)
+    };
+    let assemble = |new_stbl: Vec<u8>| -> Result<Vec<u8>> {
+        let (mfs, mfe) = minf_abs.content_range();
+        let minf_payload = splice(&patched[mfs..mfe], &[( *b"stbl", new_stbl)])?;
+        let new_minf = make_box(b"minf", &minf_payload)?;
+        let (mds, mde) = mdia_abs.content_range();
+        let mdia_payload = splice(&patched[mds..mde], &[(*b"minf", new_minf)])?;
+        let new_mdia = make_box(b"mdia", &mdia_payload)?;
+        let (tcs, tce) = trak_rel.content_range();
+        let trak_payload = splice(&patched[tcs..tce], &[(*b"mdia", new_mdia)])?;
+        let new_trak = make_box(b"trak", &trak_payload)?;
+        let moov_payload = splice(&patched, &[(*b"trak", new_trak)])?;
+        make_box(b"moov", &moov_payload)
+    };
+    // Pass 1 with placeholder offset to measure the moov size.
+    let ftyp_len = ftyp.end - ftyp.start;
+    let moov_zero = assemble(build_stbl(0)?)?;
+    let chunk_offset = ftyp_len as u64 + moov_zero.len() as u64 + 8;
+    // Pass 2 with the real chunk offset.
+    let moov_final = assemble(build_stbl(chunk_offset)?)?;
+    let new_mdat = make_box(b"mdat", &new_mdat)?;
+    let mut out = Vec::with_capacity(ftyp_len + moov_final.len() + new_mdat.len());
+    out.extend_from_slice(&data[ftyp.start..ftyp.end]);
+    out.extend_from_slice(&moov_final);
+    out.extend_from_slice(&new_mdat);
+    Ok(out)
+}
+
+// ---------- Minimal raw RGB .mov writer (fixtures, capture targets) ----------
+
+/// Parameters for [`build_raw_mov`].
+#[derive(Debug, Clone)]
+pub struct RawMovParams {
+    pub width: u16,
+    pub height: u16,
+    pub fps: u32,
+}
+
+fn identity_matrix() -> Vec<u8> {
+    let words: [u32; 9] = [
+        0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000,
+    ];
+    let mut out = Vec::with_capacity(36);
+    for w in words {
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    out
+}
+
+/// Builds a minimal playable raw-RGB24 QuickTime `.mov` (faststart:
+/// ftyp + moov + single mdat, codec `raw `, one video track).
+/// Each frame must be exactly `width*height*3` bytes; `fps` must
+/// divide 600 evenly. Pure Rust, no dependencies.
+pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8>> {
+    if params.width == 0 || params.height == 0 || frames.is_empty() {
+        return Err(parse_error("empty raw mov"));
+    }
+    if params.fps == 0 || 600 % params.fps != 0 {
+        return Err(parse_error("fps must divide 600"));
+    }
+    let frame_size = params.width as usize * params.height as usize * 3;
+    for f in frames {
+        if f.len() != frame_size {
+            return Err(parse_error("frame size mismatch"));
+        }
+    }
+    let n = frames.len() as u32;
+    let delta = 600 / params.fps;
+    let duration = n * delta;
+    // ftyp.
+    let mut ftyp_payload = Vec::new();
+    ftyp_payload.extend_from_slice(b"qt  ");
+    ftyp_payload.extend_from_slice(&0u32.to_be_bytes());
+    ftyp_payload.extend_from_slice(b"qt  ");
+    let ftyp_box = make_box(b"ftyp", &ftyp_payload)?;
+    // stsd with one `raw ` entry.
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&[0u8; 2]); // placeholder size filled below
+    entry.extend_from_slice(&[0u8; 2]);
+    entry.extend_from_slice(b"raw ");
+    entry.extend_from_slice(&[0u8; 6]); // reserved
+    entry.extend_from_slice(&1u16.to_be_bytes()); // dataref
+    entry.extend_from_slice(&0u16.to_be_bytes()); // version
+    entry.extend_from_slice(&0u16.to_be_bytes()); // revision
+    entry.extend_from_slice(b"appl"); // vendor
+    entry.extend_from_slice(&0u32.to_be_bytes()); // temporal quality
+    entry.extend_from_slice(&0x00000200u32.to_be_bytes()); // spatial quality
+    entry.extend_from_slice(&params.width.to_be_bytes());
+    entry.extend_from_slice(&params.height.to_be_bytes());
+    entry.extend_from_slice(&0x00480000u32.to_be_bytes()); // horiz resolution
+    entry.extend_from_slice(&0x00480000u32.to_be_bytes()); // vert resolution
+    entry.extend_from_slice(&0u32.to_be_bytes()); // data size
+    entry.extend_from_slice(&1u16.to_be_bytes()); // frames per sample
+    entry.extend_from_slice(&[0u8; 32]); // compressor name
+    entry.extend_from_slice(&0x0018u16.to_be_bytes()); // depth 24
+    entry.extend_from_slice(&0xFFFFu16.to_be_bytes()); // predefined
+    let entry_len = entry.len() as u32;
+    entry[0..4].copy_from_slice(&entry_len.to_be_bytes());
+    let mut real_entry = entry_len.to_be_bytes().to_vec();
+    real_entry.extend_from_slice(&entry[4..]);
+    let mut stsd_payload = vec![0u8; 8];
+    stsd_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&real_entry);
+    let stsd_box = make_box(b"stsd", &stsd_payload)?;
+    // stts / stsc / stsz / stco.
+    let mut stts_payload = vec![0u8; 8];
+    stts_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stts_payload.extend_from_slice(&n.to_be_bytes());
+    stts_payload.extend_from_slice(&delta.to_be_bytes());
+    let stts_box = make_box(b"stts", &stts_payload)?;
+    let mut stsc_payload = vec![0u8; 8];
+    stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&n.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    let stsc_box = make_box(b"stsc", &stsc_payload)?;
+    let mut stsz_payload = vec![0u8; 12];
+    stsz_payload[4..8].copy_from_slice(&(frame_size as u32).to_be_bytes());
+    stsz_payload[8..12].copy_from_slice(&n.to_be_bytes());
+    let stsz_box = make_box(b"stsz", &stsz_payload)?;
+    // stco placeholder, fixed after moov size is known.
+    let build_moov = |chunk_offset: u32| -> Result<Vec<u8>> {
+        let mut stco_payload = vec![0u8; 8];
+        stco_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stco_payload.extend_from_slice(&chunk_offset.to_be_bytes());
+        let stco_box = make_box(b"stco", &stco_payload)?;
+        let mut stbl_payload = Vec::new();
+        stbl_payload.extend_from_slice(&stsd_box);
+        stbl_payload.extend_from_slice(&stts_box);
+        stbl_payload.extend_from_slice(&stsc_box);
+        stbl_payload.extend_from_slice(&stsz_box);
+        stbl_payload.extend_from_slice(&stco_box);
+        let stbl_box = make_box(b"stbl", &stbl_payload)?;
+        // vmhd / dinf(dref url) / minf.
+        let mut vmhd_payload = vec![0u8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let _ = &mut vmhd_payload;
+        let vmhd_box = make_box(b"vmhd", &vmhd_payload)?;
+        let mut url_entry = Vec::new();
+        url_entry.extend_from_slice(&12u32.to_be_bytes());
+        url_entry.extend_from_slice(b"url ");
+        url_entry.extend_from_slice(&[0u8, 0, 0, 1]);
+        let mut dref_payload = vec![0u8; 8];
+        dref_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        dref_payload.extend_from_slice(&url_entry);
+        let dref_box = make_box(b"dref", &dref_payload)?;
+        let dinf_box = make_box(b"dinf", &dref_box)?;
+        let mut minf_payload = Vec::new();
+        minf_payload.extend_from_slice(&vmhd_box);
+        minf_payload.extend_from_slice(&dinf_box);
+        minf_payload.extend_from_slice(&stbl_box);
+        let minf_box = make_box(b"minf", &minf_payload)?;
+        // mdhd / hdlr / mdia.
+        let mut mdhd_payload = vec![0u8; 24];
+        mdhd_payload[12..16].copy_from_slice(&600u32.to_be_bytes());
+        mdhd_payload[16..20].copy_from_slice(&duration.to_be_bytes());
+        mdhd_payload[20..22].copy_from_slice(&0x55C4u16.to_be_bytes());
+        let mdhd_box = make_box(b"mdhd", &mdhd_payload)?;
+        let mut hdlr_payload = vec![0u8; 8];
+        hdlr_payload.extend_from_slice(b"vide");
+        hdlr_payload.extend_from_slice(&[0u8; 12]);
+        hdlr_payload.extend_from_slice(b"VideoHandler\0");
+        let hdlr_box = make_box(b"hdlr", &hdlr_payload)?;
+        let mut mdia_payload = Vec::new();
+        mdia_payload.extend_from_slice(&mdhd_box);
+        mdia_payload.extend_from_slice(&hdlr_box);
+        mdia_payload.extend_from_slice(&minf_box);
+        let mdia_box = make_box(b"mdia", &mdia_payload)?;
+        // tkhd.
+        let mut tkhd_payload = vec![0u8; 84];
+        tkhd_payload[12..16].copy_from_slice(&1u32.to_be_bytes());
+        tkhd_payload[16..20].copy_from_slice(&duration.to_be_bytes());
+        tkhd_payload[44..80].copy_from_slice(&identity_matrix());
+        tkhd_payload[76..80].copy_from_slice(&((params.width as u32) << 16).to_be_bytes());
+        tkhd_payload[80..84].copy_from_slice(&((params.height as u32) << 16).to_be_bytes());
+        let tkhd_box = make_box(b"tkhd", &tkhd_payload)?;
+        let mut trak_payload = Vec::new();
+        trak_payload.extend_from_slice(&tkhd_box);
+        trak_payload.extend_from_slice(&mdia_box);
+        let trak_box = make_box(b"trak", &trak_payload)?;
+        // mvhd.
+        let mut mvhd_payload = vec![0u8; 100];
+        mvhd_payload[12..16].copy_from_slice(&600u32.to_be_bytes());
+        mvhd_payload[16..20].copy_from_slice(&duration.to_be_bytes());
+        mvhd_payload[20..24].copy_from_slice(&0x00010000u32.to_be_bytes());
+        mvhd_payload[24..26].copy_from_slice(&0x0100u16.to_be_bytes());
+        mvhd_payload[32..68].copy_from_slice(&identity_matrix());
+        mvhd_payload[96..100].copy_from_slice(&2u32.to_be_bytes());
+        let mvhd_box = make_box(b"mvhd", &mvhd_payload)?;
+        let mut moov_payload = Vec::new();
+        moov_payload.extend_from_slice(&mvhd_box);
+        moov_payload.extend_from_slice(&trak_box);
+        make_box(b"moov", &moov_payload)
+    };
+    let moov_zero = build_moov(0)?;
+    let chunk_offset = (ftyp_box.len() + moov_zero.len() + 8) as u32;
+    let moov_box = build_moov(chunk_offset)?;
+    let mut mdat_payload = Vec::with_capacity(frames.iter().map(|f| f.len()).sum());
+    for f in frames {
+        mdat_payload.extend_from_slice(f);
+    }
+    let mdat_box = make_box(b"mdat", &mdat_payload)?;
+    let mut out = Vec::with_capacity(ftyp_box.len() + moov_box.len() + mdat_box.len());
+    out.extend_from_slice(&ftyp_box);
+    out.extend_from_slice(&moov_box);
+    out.extend_from_slice(&mdat_box);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +1641,59 @@ mod tests {
         std::fs::write(&path, b"....ftypqt  ................").unwrap();
         assert!(read_mov_info(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn raw_fixture(frames: u32) -> Vec<u8> {
+        let params = RawMovParams {
+            width: 4,
+            height: 2,
+            fps: 10,
+        };
+        let body: Vec<Vec<u8>> = (0..frames)
+            .map(|f| vec![f as u8; 4 * 2 * 3])
+            .collect();
+        build_raw_mov(&params, &body).unwrap()
+    }
+
+    #[test]
+    fn raw_writer_roundtrips() {
+        let file = raw_fixture(10);
+        assert!(is_mov_bytes(&file));
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-raw-{}.mov", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let info = read_mov_info(&path).unwrap();
+        assert_eq!((info.width, info.height), (4, 2));
+        assert_eq!(info.video_fourcc, "raw ");
+        assert!((info.duration_secs - 1.0).abs() < 0.001);
+        assert!((info.framerate - 10.0).abs() < 0.01);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_trim_selects_frames() {
+        let file = raw_fixture(10);
+        // 10 fps: frames 2,3,4 live in [0.2, 0.5).
+        let out = trim_mov_bytes(&file, 0.2, 0.5).unwrap();
+        assert!(is_mov_bytes(&out));
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-trim-{}.mov", std::process::id()));
+        std::fs::write(&path, &out).unwrap();
+        let info = read_mov_info(&path).unwrap();
+        assert!((info.duration_secs - 0.3).abs() < 0.001);
+        assert_eq!((info.width, info.height), (4, 2));
+        // First output frame must equal source frame 2.
+        let top = scan_children(&out).unwrap();
+        let mdat = top.iter().find(|(t, _)| t == b"mdat").unwrap().1;
+        let (s, _) = mdat.content_range();
+        assert_eq!(&out[s..s + 24], &[2u8; 24][..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_trim_rejects_empty_range() {
+        let file = raw_fixture(10);
+        assert!(trim_mov_bytes(&file, 5.0, 6.0).is_err());
+        assert!(trim_mov_bytes(&file, 0.5, 0.5).is_err());
     }
 }

@@ -32,6 +32,41 @@ pub fn transcode(input: &Path, output: &Path, preset: ExportPreset) -> Result<()
 - `ExportPreset::H264Fast` writes H264 + AAC, `WebM` writes VP9 + Opus.
 - Output container follows the file extension.
 
+## `transcode_prores`
+
+```rust
+pub fn transcode_prores(input: &Path, output: &Path, profile: ProResProfile) -> Result<()>
+```
+
+- Validates `input` via `probe_container` first.
+- Executes via ffmpeg `prores_ks` until the native GPU encoder lands.
+
+## `trim_mov_native`
+
+```rust
+pub fn trim_mov_native(input: &Path, start_secs: f64, end_secs: f64, output: &Path) -> Result<()>
+```
+
+- Pure Rust, no ffmpeg: rewrites sample tables (`stts`, `stsc`,
+  `stsz`, `stco`/`co64`, `stss`, `ctts`) and durations (`mvhd`,
+  `mdhd`, `tkhd`), copies frame bytes into a single `mdat`.
+- Works on single-track `.mov` files of any codec (including ProRes
+  and raw); output is faststart (`ftyp` + `moov` + `mdat`).
+- Returns `Err(MediaError::InvalidSeek)` for bad ranges or empty
+  selections, `Err(MediaError::ParseError)` for multi-track files,
+  edit lists or compact sample tables.
+- Returns `Err(MediaError::UnsupportedFormat)` unless `output` ends
+  in `.mov`, `.mp4` or `.m4v`.
+
+## `build_raw_mov`
+
+```rust
+pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8>>
+```
+
+- Builds a minimal playable raw-RGB24 `.mov` (codec `raw `).
+- Each frame must be `width * height * 3` bytes; `fps` must divide 600.
+
 ### `ExportPreset`
 
 | Variant | Meaning |
@@ -54,3 +89,4 @@ trim(Path::new("in.mp4"), 5.0, 15.0, Path::new("out.mp4"), ExportPreset::Copy)?;
 
 - [Capture.md](Capture.md) – takes that get trimmed here
 - [Metadata.md](Metadata.md) – verify durations before cutting
+- [ProRes.md](ProRes.md) – native MOV parser details
