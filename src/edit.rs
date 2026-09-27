@@ -1,8 +1,13 @@
-//! Basic editing: trim, concat and transcode via ffmpeg.
+//! Basic editing: trim, concat and transcode.
 //!
 //! - Trim: `ffmpeg -ss <start> -to <end> -c copy` (fast) or re-encode.
 //! - Concat: ffmpeg concat demuxer with a temp file list.
-//! - Transcode: container/codec switch between MP4/WebM/MKV.
+//! - Transcode: container/codec switch between MP4/WebM/MKV/MOV.
+//! - ProRes: `transcode_prores` writes ProRes 422 family targets
+//!   (`prores_ks`); native GPU encode follows without API churn.
+//!
+//! All inputs validate via `format::probe_container` first so `.mov`
+//! behaves 1:1 offline; execution stays on ffmpeg for now.
 
 use crate::error::{MediaError, Result};
 use std::path::Path;
@@ -46,6 +51,8 @@ pub fn trim(
     output: &Path,
     preset: ExportPreset,
 ) -> Result<()> {
+    crate::format::probe_container(input)?;
+    crate::format::probe_container(output).ok();
     if start_secs < 0.0 || end_secs <= start_secs {
         return Err(MediaError::InvalidSeek(format!(
             "{start_secs}-{end_secs}"
@@ -71,6 +78,9 @@ pub fn trim(
 pub fn concat(inputs: &[&Path], output: &Path) -> Result<()> {
     if inputs.is_empty() {
         return Err(MediaError::ParseError("no inputs to concat".into()));
+    }
+    for input in inputs {
+        crate::format::probe_container(input)?;
     }
     let list_file = std::env::temp_dir().join(format!("mediakit-concat-{}.txt", std::process::id()));
     let mut list = String::new();
@@ -103,6 +113,7 @@ pub fn concat(inputs: &[&Path], output: &Path) -> Result<()> {
 
 /// Transcodes `input` into `output` with `preset`.
 pub fn transcode(input: &Path, output: &Path, preset: ExportPreset) -> Result<()> {
+    crate::format::probe_container(input)?;
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-i"]);
     cmd.arg(input);
@@ -116,6 +127,31 @@ pub fn transcode(input: &Path, output: &Path, preset: ExportPreset) -> Result<()
     } else {
         Err(MediaError::CommandFailed(
             "ffmpeg transcode failed".into(),
+        ))
+    }
+}
+
+/// Transcodes `input` into a ProRes `.mov` target.
+/// Validates natively, executes via ffmpeg `prores_ks` for now.
+pub fn transcode_prores(
+    input: &Path,
+    output: &Path,
+    profile: crate::prores::ProResProfile,
+) -> Result<()> {
+    crate::format::probe_container(input)?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-i"]);
+    cmd.arg(input);
+    for arg in crate::prores::prores_ffmpeg_args(profile) {
+        cmd.arg(arg);
+    }
+    cmd.arg(output);
+    let status = cmd.status().map_err(MediaError::from_io)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(MediaError::CommandFailed(
+            "ffmpeg prores transcode failed".into(),
         ))
     }
 }

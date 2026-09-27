@@ -316,3 +316,49 @@ pub extern "C" fn tontoo_mediakit_system_volume_get() -> i32 {
         .map(|v| v as i32)
         .unwrap_or(-1)
 }
+
+/// Native `.mov` info as JSON (no ffprobe required), or NULL.
+#[no_mangle]
+pub extern "C" fn tontoo_mediakit_mov_info(
+    path: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    let Some(path) = c_str(path) else {
+        set_error(error_out, "invalid path");
+        return std::ptr::null_mut();
+    };
+    match crate::read_mov_info(Path::new(&path)) {
+        Ok(info) => json_ptr(&json!({
+            "major_brand": info.major_brand,
+            "duration_secs": info.duration_secs,
+            "width": info.width,
+            "height": info.height,
+            "video_fourcc": info.video_fourcc,
+            "audio_fourcc": info.audio_fourcc,
+            "framerate": info.framerate,
+            "container": info.container_name(),
+        })),
+        Err(e) => {
+            set_error(error_out, &e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// ProRes profile for a fourcc string: 1 proxy, 2 LT, 3 standard,
+/// 4 HQ, 5 4444, 6 4444XQ, 0 unknown.
+#[no_mangle]
+pub extern "C" fn tontoo_mediakit_prores_profile(fourcc: *const c_char) -> i32 {
+    let Some(fourcc) = c_str(fourcc) else {
+        return 0;
+    };
+    match crate::profile_from_fourcc(&fourcc) {
+        crate::ProResProfile::Proxy => 1,
+        crate::ProResProfile::Lt => 2,
+        crate::ProResProfile::Standard => 3,
+        crate::ProResProfile::Hq => 4,
+        crate::ProResProfile::FourFourFourFour => 5,
+        crate::ProResProfile::FourFourFourFourXq => 6,
+        crate::ProResProfile::Unknown => 0,
+    }
+}

@@ -1,7 +1,8 @@
 //! Container / codec format helpers.
 //!
 //! Playback targets MP4, WebM, MKV and best-effort AVI. Detection is
-//! extension-first with ffprobe as the authority for the real container.
+//! extension-first; `.mov`/`.mp4`/`.m4v` additionally validate natively
+//! via `crate::mov` (ftyp sniff, no ffprobe required).
 
 use crate::error::{MediaError, Result};
 use std::path::Path;
@@ -11,6 +12,9 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "avi", "mov", 
 
 /// Best-effort extensions (demuxed when ffmpeg supports them).
 pub const EXTRA_EXTENSIONS: &[&str] = &["ogv", "ts", "m2ts", "flv"];
+
+/// Extensions with a native MOV parser (see `crate::mov`).
+pub const MOV_EXTENSIONS: &[&str] = &["mov", "mp4", "m4v"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoContainer {
@@ -66,6 +70,10 @@ pub fn is_supported(path: &Path) -> bool {
 }
 
 /// Validates `path` for playback, returning its container.
+///
+/// Extension stays the authority (1:1 compatible, no file access), so
+/// headless tests with virtual names keep working. Use
+/// `probe_container_native` for ftyp-level `.mov` validation.
 pub fn probe_container(path: &Path) -> Result<VideoContainer> {
     let ext = extension_of(path).unwrap_or_default();
     if ext.is_empty() {
@@ -80,6 +88,26 @@ pub fn probe_container(path: &Path) -> Result<VideoContainer> {
         return Err(MediaError::UnsupportedFormat(ext));
     }
     Ok(container)
+}
+
+/// Native `.mov`/`.mp4`/`.m4v` validation via ftyp sniff.
+/// Returns `Ok(true)` for confirmed MOV files, `Ok(false)` when the
+/// file is missing (extension stays authoritative), and `Err` when a
+/// present file fails the sniff.
+pub fn probe_container_native(path: &Path) -> Result<bool> {
+    let ext = extension_of(path).unwrap_or_default();
+    if !MOV_EXTENSIONS.contains(&ext.as_str()) {
+        return Ok(false);
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    if crate::mov::sniff_mov(path) {
+        return Ok(true);
+    }
+    // Present but no ftyp: still extension-accepted for 1:1 compat,
+    // native metadata will fall back to ffprobe.
+    Ok(false)
 }
 
 #[cfg(test)]

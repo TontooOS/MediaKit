@@ -28,6 +28,8 @@ tontoo_mediakit_close(id);
 | Function | Return | Meaning |
 |---|---|---|
 | `tontoo_mediakit_metadata` | `char *` / `NULL` | JSON metadata, NULL on error |
+| `tontoo_mediakit_mov_info` | `char *` / `NULL` | Native MOV JSON, NULL on error |
+| `tontoo_mediakit_prores_profile` | `int` | 1 proxy, 2 LT, 3 standard, 4 HQ, 5 4444, 6 4444XQ, 0 unknown |
 | `tontoo_mediakit_list_cameras` | `char *` / `NULL` | JSON camera array, NULL on error |
 | `tontoo_mediakit_load_subtitles` | `0` / `1` | 0 when the SRT/VTT loaded |
 | `tontoo_mediakit_chapters` | `char *` | JSON chapter array (empty when none) |
@@ -51,3 +53,4 @@ Metadata JSON:
 
 - [Playback.md](Playback.md) – Rust transport API
 - [Metadata.md](Metadata.md) – metadata field meanings
+- [ProRes.md](ProRes.md) – MOV and ProRes native API

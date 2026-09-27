@@ -1,7 +1,9 @@
-//! Video metadata via ffprobe (duration, resolution, codec, framerate).
+//! Video metadata: native `.mov` parser first, ffprobe fallback.
 //!
-//! `read_metadata` shells to `ffprobe -v quiet -print_format json
-//! -show_format -show_streams`. When ffprobe is missing it returns
+//! `read_metadata` tries `crate::mov::read_mov_metadata` for
+//! `.mov`/`.mp4`/`.m4v` so those behave 1:1 without binaries, then
+//! shells to `ffprobe -v quiet -print_format json -show_format
+//! -show_streams`. When ffprobe is missing it returns
 //! `MediaError::FfmpegMissing`; unparsable output is `ParseError`.
 
 use crate::error::{MediaError, Result};
@@ -53,8 +55,16 @@ struct FfprobeStream {
     avg_frame_rate: Option<String>,
 }
 
-/// Reads metadata for `path` via ffprobe.
+/// Reads metadata for `path`, native MOV first, ffprobe fallback.
 pub fn read_metadata(path: &Path) -> Result<VideoMetadata> {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if crate::mov::is_mov_extension(ext) && path.exists() {
+            if let Ok(meta) = crate::mov::read_mov_metadata(path) {
+                return Ok(meta);
+            }
+            // Fall through to ffprobe for damaged/partial MOV files.
+        }
+    }
     let out = Command::new("ffprobe")
         .args([
             "-v",

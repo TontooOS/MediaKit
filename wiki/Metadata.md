@@ -1,6 +1,7 @@
 # Metadata
 
-Video metadata (duration, resolution, codec, framerate) via ffprobe.
+Video metadata (duration, resolution, codec, framerate), natively for
+`.mov`/`.mp4`/`.m4v` plus ffprobe fallback.
 
 ## `read_metadata`
 
@@ -8,7 +9,8 @@ Video metadata (duration, resolution, codec, framerate) via ffprobe.
 pub fn read_metadata(path: &Path) -> Result<VideoMetadata>
 ```
 
-- Runs `ffprobe -v quiet -print_format json -show_format -show_streams`.
+- Tries `read_mov_metadata` first for MOV extensions (no binary needed).
+- Runs `ffprobe -v quiet -print_format json -show_format -show_streams` otherwise.
 - Returns `Err(MediaError::FfmpegMissing)` when ffprobe is not on PATH
   (surfaced as `IoError` NotFound mapping).
 - Returns `Err(MediaError::ParseError)` on unparsable JSON.
@@ -38,3 +40,4 @@ println!("{:.1}s {}x{}", meta.duration_secs, meta.width, meta.height);
 
 - [Playback.md](Playback.md) – duration feeds the player clock
 - [Thumbnails.md](Thumbnails.md) – frame extraction for the same files
+- [ProRes.md](ProRes.md) – native MOV parser details

@@ -8,7 +8,9 @@ pub mod error;
 pub mod format;
 pub mod lang;
 pub mod metadata;
+pub mod mov;
 pub mod playback;
+pub mod prores;
 pub mod streaming;
 pub mod subtitles;
 pub mod thumbnails;
@@ -18,11 +20,16 @@ pub use capture::{list_cameras, snapshot, start_capture, CameraDevice, CameraKin
 pub use chapters::{read_chapters, Chapter, ChapterList};
 pub use controls::{transport_bar, ControlDescriptor, ControlIcon};
 pub use devices::{available_cameras, available_outputs, VideoOutput};
-pub use edit::{concat, transcode, trim, ExportPreset};
+pub use edit::{concat, transcode, transcode_prores, trim, ExportPreset};
 pub use error::{MediaError, Result};
-pub use format::{is_supported, probe_container, VideoContainer, SUPPORTED_EXTENSIONS};
+pub use format::{is_supported, probe_container, probe_container_native, VideoContainer, MOV_EXTENSIONS, SUPPORTED_EXTENSIONS};
 pub use metadata::{read_metadata, VideoMetadata};
+pub use mov::{is_mov_extension, read_mov_info, read_mov_metadata, sniff_mov, MovInfo};
 pub use playback::{DisplayMode, PlaybackState, VideoPlayer, MAX_SPEED, MIN_SPEED};
+pub use prores::{
+    detect_profile_from_mov, gpu_slice_plan, is_prores_fourcc, parse_frame_header,
+    profile_from_fourcc, ProResChroma, ProResFrameHeader, ProResProfile, PRORES_FOURCCS,
+};
 pub use streaming::{detect_kind, fetch_hls_playlist, fetch_progressive, fetch_segment, BufferState, HlsPlaylist, StreamEvent, StreamKind};
 pub use subtitles::{SubtitleCue, SubtitleTrack};
 pub use thumbnails::{extract_args, extract_frame};

@@ -1,8 +1,10 @@
-//! Thumbnails / frame extraction via ffmpeg.
+//! Thumbnails / frame extraction.
 //!
 //! `extract_frame` runs `ffmpeg -ss <at> -i <input> -vframes 1 <output>`
-//! which works for MP4/WebM/MKV/AVI without extra codecs. Used by the
-//! Finder for video previews.
+//! which works for MP4/WebM/MKV/AVI/MOV without extra codecs. `.mov`
+//! inputs validate natively first (extension + ftyp sniff); pixel
+//! decode stays on the ffmpeg path until the native GPU decoder lands.
+//! Used by the Finder for video previews.
 
 use crate::error::{MediaError, Result};
 use std::path::Path;
@@ -12,6 +14,13 @@ use std::process::Command;
 pub fn extract_frame(input: &Path, at_secs: f64, output: &Path) -> Result<()> {
     if at_secs < 0.0 || !at_secs.is_finite() {
         return Err(MediaError::InvalidSeek(at_secs.to_string()));
+    }
+    crate::format::probe_container(input)?;
+    if !input.exists() {
+        return Err(MediaError::IoError(format!(
+            "file not found: {}",
+            input.to_string_lossy()
+        )));
     }
     let status = Command::new("ffmpeg")
         .args([
