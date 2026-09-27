@@ -11,6 +11,8 @@ pub mod metadata;
 pub mod mov;
 pub mod playback;
 pub mod prores;
+pub mod prores_blocks;
+pub mod prores_frame;
 pub mod streaming;
 pub mod subtitles;
 pub mod thumbnails;
@@ -29,6 +31,14 @@ pub use playback::{DisplayMode, PlaybackState, VideoPlayer, MAX_SPEED, MIN_SPEED
 pub use prores::{
     detect_profile_from_mov, gpu_slice_plan, is_prores_fourcc, parse_frame_header,
     profile_from_fourcc, ProResChroma, ProResFrameHeader, ProResProfile, PRORES_FOURCCS,
+};
+pub use prores_blocks::{
+    decode_block, dequantize_block, dct_8x8, encode_block, idct_8x8, quantize_block,
+    roundtrip_block, BitReader, BitWriter, UNIFORM_QM, ZIGZAG,
+};
+pub use prores_frame::{
+    decode_frame, encode_frame_fixture, slice_bands, yuv_to_rgb, DecodeError, YuvFrame,
+    K_AC, K_DC, MAX_QUANT,
 };
 pub use streaming::{detect_kind, fetch_hls_playlist, fetch_progressive, fetch_segment, BufferState, HlsPlaylist, StreamEvent, StreamKind};
 pub use subtitles::{SubtitleCue, SubtitleTrack};
