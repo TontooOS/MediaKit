@@ -47,14 +47,16 @@ pub fn transcode_prores(input: &Path, output: &Path, profile: ProResProfile) -> 
 pub fn trim_mov_native(input: &Path, start_secs: f64, end_secs: f64, output: &Path) -> Result<()>
 ```
 
-- Pure Rust, no ffmpeg: rewrites sample tables (`stts`, `stsc`,
-  `stsz`, `stco`/`co64`, `stss`, `ctts`) and durations (`mvhd`,
-  `mdhd`, `tkhd`), copies frame bytes into a single `mdat`.
-- Works on single-track `.mov` files of any codec (including ProRes
-  and raw); output is faststart (`ftyp` + `moov` + `mdat`).
+- Pure Rust, no ffmpeg: every video/audio track is cut in its own
+  timescale; sample tables (`stts`, `stsc`, `stsz`, `stco`/`co64`,
+  `stss`, `ctts`) and durations (`mvhd`, `mdhd`, `tkhd`) are
+  rewritten, frame bytes land in one chunk per track.
+- Works on multi-track `.mov` files of any codec (including ProRes
+  and raw video plus PCM `sowt` audio); output is faststart
+  (`ftyp` + `moov` + `mdat`).
 - Returns `Err(MediaError::InvalidSeek)` for bad ranges or empty
-  selections, `Err(MediaError::ParseError)` for multi-track files,
-  edit lists or compact sample tables.
+  selections, `Err(MediaError::ParseError)` for edit lists, compact
+  sample tables or non-A/V tracks.
 - Returns `Err(MediaError::UnsupportedFormat)` unless `output` ends
   in `.mov`, `.mp4` or `.m4v`.
 

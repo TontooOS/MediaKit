@@ -45,6 +45,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: Audio track support (PCM `sowt` writer, multi-track native trim).
 - 2026-09-27: Native AVI support (`avi`, metadata, chapters, FFI).
 - 2026-09-27: WebM proven native (VP9/Opus fixture, same `mkv` path).
 - 2026-09-27: Native Matroska/WebM support (`mkv`, metadata, chapters, FFI).

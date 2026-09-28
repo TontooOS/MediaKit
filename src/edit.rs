@@ -156,11 +156,12 @@ pub fn transcode_prores(
     }
 }
 
-/// Losslessly trims a single-track `.mov` to `[start_secs, end_secs)`
-/// with pure Rust (no ffmpeg): sample tables and durations are
-/// rewritten, frame bytes are copied. Supports uniform or indexed
-/// `stsz`, `stco`/`co64`, optional `stss`/`ctts`; multi-track files,
-/// edit lists and compact sample tables return `ParseError`.
+/// Losslessly trims a `.mov` to `[start_secs, end_secs)` with pure
+/// Rust (no ffmpeg): every video/audio track is cut independently in
+/// its own timescale, sample tables and durations are rewritten,
+/// frame bytes land in one chunk per track. Supports uniform or
+/// indexed `stsz`, `stco`/`co64`, optional `stss`/`ctts`; edit lists,
+/// compact sample tables and non-A/V tracks return `ParseError`.
 pub fn trim_mov_native(
     input: &Path,
     start_secs: f64,

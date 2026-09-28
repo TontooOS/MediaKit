@@ -616,6 +616,7 @@ struct SttsRun {
 
 #[derive(Debug, Clone, Default)]
 struct ParsedTrak {
+    handler: String,
     tkhd: Span,
     tkhd_version: u8,
     mdhd: Span,
@@ -875,8 +876,8 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
         return Err(parse_error("truncated hdlr"));
     }
     let handler = fourcc(&mdia[hs + 8..hs + 12]).trim().to_string();
-    if handler != "vide" {
-        return Err(parse_error("native trim supports one video track only"));
+    if handler != "vide" && handler != "soun" {
+        return Err(parse_error("native trim supports video+audio only"));
     }
     let minf_abs = abs_span(
         ms,
@@ -967,6 +968,7 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
         return Err(parse_error("null media timescale"));
     }
     Ok(ParsedTrak {
+        handler,
         tkhd,
         tkhd_version: tkhd_body[0],
         mdhd,
@@ -1121,8 +1123,24 @@ pub(crate) fn trim_mov_bytes(data: &[u8], start_secs: f64, end_secs: f64) -> Res
         .filter(|(t, _)| t == b"trak")
         .map(|(_, s)| *s)
         .collect();
-    if trak_spans.len() != 1 {
-        return Err(parse_error("native trim supports one track only"));
+    if trak_spans.len() > 1 {
+        let (ds, de) = mdats[0].content_range();
+        return trim_mov_bytes_multi(
+            data,
+            moov,
+            &trak_spans,
+            &data[ds..de],
+            ds as u64,
+            movie_timescale,
+            mvhd_span,
+            mvhd_version,
+            start_secs,
+            end_secs,
+            ftyp,
+        );
+    }
+    if trak_spans.is_empty() {
+        return Err(parse_error("missing trak"));
     }
     // scan_children ran on the moov content, so spans are already
     // moov-relative.
@@ -1239,7 +1257,7 @@ pub(crate) fn trim_mov_bytes(data: &[u8], start_secs: f64, end_secs: f64) -> Res
         }
         new_ctts_box = Some(make_box(b"ctts", &payload)?);
     }
-/// Builds the single-entry `stco`/`co64` box for the new chunk offset.
+/// Builds the single-entry `stco`/`co64` box for a new chunk offset.
 fn chunk_offset_box(wide: bool, chunk_offset: u64) -> Result<Vec<u8>> {
     let mut payload = vec![0u8; 8];
     payload[4..8].copy_from_slice(&1u32.to_be_bytes());
@@ -1252,6 +1270,290 @@ fn chunk_offset_box(wide: bool, chunk_offset: u64) -> Result<Vec<u8>> {
         );
         make_box(b"stco", &payload)
     }
+}
+
+/// Rebuilds one trak box with a new `stbl`, resolving `mdia`/`minf`
+/// against `base` (a moov-payload copy with identical layout).
+fn rebuild_trak(base: &[u8], trak_rel: Span, new_stbl: Vec<u8>) -> Result<Vec<u8>> {
+    let (tcs, tce) = trak_rel.content_range();
+    let trak_bytes = base
+        .get(tcs..tce)
+        .ok_or_else(|| parse_error("trak out of range"))?;
+    let trak_kids = scan_children(trak_bytes)?;
+    let mdia_box =
+        find_child(&trak_kids, b"mdia").ok_or_else(|| parse_error("trak missing mdia"))?;
+    let mdia_abs = Span {
+        start: tcs + mdia_box.start,
+        end: tcs + mdia_box.end,
+        header: mdia_box.header,
+    };
+    let (mdcs, mdce) = mdia_abs.content_range();
+    let mdia_bytes = base
+        .get(mdcs..mdce)
+        .ok_or_else(|| parse_error("mdia out of range"))?;
+    let mdia_kids = scan_children(mdia_bytes)?;
+    let minf_box =
+        find_child(&mdia_kids, b"minf").ok_or_else(|| parse_error("mdia missing minf"))?;
+    let minf_abs = Span {
+        start: mdcs + minf_box.start,
+        end: mdcs + minf_box.end,
+        header: minf_box.header,
+    };
+    let (mfs, mfe) = minf_abs.content_range();
+    let minf_payload = splice(&base[mfs..mfe], &[(*b"stbl", new_stbl)])?;
+    let new_minf = make_box(b"minf", &minf_payload)?;
+    let (mds, mde) = mdia_abs.content_range();
+    let mdia_payload = splice(&base[mds..mde], &[(*b"minf", new_minf)])?;
+    let new_mdia = make_box(b"mdia", &mdia_payload)?;
+    let trak_payload = splice(&base[tcs..tce], &[(*b"mdia", new_mdia)])?;
+    make_box(b"trak", &trak_payload)
+}
+
+/// Lossless native trim of a multi-track `.mov`: each video/audio
+/// track is cut independently in its own timescale, samples land in
+/// one chunk per track. No ffmpeg involved.
+#[allow(clippy::too_many_arguments)]
+fn trim_mov_bytes_multi(
+    data: &[u8],
+    moov: &[u8],
+    trak_spans: &[Span],
+    mdat: &[u8],
+    mdat_base: u64,
+    movie_timescale: u32,
+    mvhd_span: Span,
+    mvhd_version: u8,
+    start_secs: f64,
+    end_secs: f64,
+    ftyp: Span,
+) -> Result<Vec<u8>> {
+    struct Cut {
+        trak_rel: Span,
+        trak: ParsedTrak,
+        data: Vec<u8>,
+        media_duration: u64,
+        stts: Vec<u8>,
+        stsc: Vec<u8>,
+        stsz: Vec<u8>,
+        stss: Option<Vec<u8>>,
+        ctts: Option<Vec<u8>>,
+    }
+    let mut cuts: Vec<Cut> = Vec::new();
+    for rel in trak_spans {
+        let trak = parse_trak_tables(moov, *rel)?;
+        if trak.handler != "vide" && trak.handler != "soun" {
+            return Err(parse_error("native trim supports video+audio only"));
+        }
+        let samples = expand_samples(&trak)?;
+        let media_ts = trak.media_timescale as f64;
+        let s_ts = (start_secs * media_ts).round() as u64;
+        let e_ts = (end_secs * media_ts).round() as u64;
+        let mut time = 0u64;
+        let mut selected = Vec::new();
+        for (i, &delta) in samples.deltas.iter().enumerate() {
+            if time >= s_ts && time < e_ts {
+                selected.push(i);
+            }
+            time += delta as u64;
+        }
+        if selected.is_empty() {
+            return Err(MediaError::InvalidSeek(format!("{start_secs}-{end_secs}")));
+        }
+        let n = selected.len();
+        let deltas: Vec<u32> = selected.iter().map(|&i| samples.deltas[i]).collect();
+        let sizes: Vec<u32> = selected.iter().map(|&i| samples.sizes[i]).collect();
+        let media_duration: u64 = deltas.iter().map(|&d| d as u64).sum();
+        let mut track_data = Vec::new();
+        for &i in &selected {
+            let off = samples.offsets[i]
+                .checked_sub(mdat_base)
+                .ok_or_else(|| parse_error("sample outside mdat"))?
+                as usize;
+            let size = samples.sizes[i] as usize;
+            if off + size > mdat.len() {
+                return Err(parse_error("sample overruns mdat"));
+            }
+            track_data.extend_from_slice(&mdat[off..off + size]);
+        }
+        let mut stts_payload = vec![0u8; 8];
+        let runs = repack_runs_u32(&deltas);
+        stts_payload[4..8].copy_from_slice(&(runs.len() as u32).to_be_bytes());
+        for (count, delta) in &runs {
+            stts_payload.extend_from_slice(&count.to_be_bytes());
+            stts_payload.extend_from_slice(&delta.to_be_bytes());
+        }
+        let new_stts = make_box(b"stts", &stts_payload)?;
+        let mut stsc_payload = vec![0u8; 8];
+        stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&(n as u32).to_be_bytes());
+        stsc_payload.extend_from_slice(&trak.stsc[0].2.to_be_bytes());
+        let new_stsc = make_box(b"stsc", &stsc_payload)?;
+        let uniform = sizes.iter().all(|&s| s == sizes[0]);
+        let mut stsz_payload = vec![0u8; 12];
+        if uniform {
+            stsz_payload[4..8].copy_from_slice(&sizes[0].to_be_bytes());
+            stsz_payload[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+        } else {
+            stsz_payload[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+            for &s in &sizes {
+                stsz_payload.extend_from_slice(&s.to_be_bytes());
+            }
+        }
+        let new_stsz = make_box(b"stsz", &stsz_payload)?;
+        let new_stss = match &trak.stss {
+            Some(sync) => {
+                let set: std::collections::HashSet<u32> = sync.iter().copied().collect();
+                let remapped: Vec<u32> = selected
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &orig)| set.contains(&(orig as u32 + 1)))
+                    .map(|(pos, _)| pos as u32 + 1)
+                    .collect();
+                let mut payload = vec![0u8; 8];
+                payload[4..8].copy_from_slice(&(remapped.len() as u32).to_be_bytes());
+                for &s in &remapped {
+                    payload.extend_from_slice(&s.to_be_bytes());
+                }
+                Some(make_box(b"stss", &payload)?)
+            }
+            None => None,
+        };
+        let new_ctts = match trak.ctts_version {
+            Some(v) => {
+                let expanded = expand_ctts(&trak.ctts, samples.deltas.len())?;
+                let sliced: Vec<i64> = selected.iter().map(|&i| expanded[i]).collect();
+                let runs = repack_runs_i64(&sliced);
+                let mut payload = vec![v, 0, 0, 0];
+                payload.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+                for (count, offset) in &runs {
+                    payload.extend_from_slice(&count.to_be_bytes());
+                    if v == 1 {
+                        payload.extend_from_slice(&(*offset as i32).to_be_bytes());
+                    } else {
+                        payload.extend_from_slice(&(*offset as u32).to_be_bytes());
+                    }
+                }
+                Some(make_box(b"ctts", &payload)?)
+            }
+            None => None,
+        };
+        cuts.push(Cut {
+            trak_rel: *rel,
+            trak,
+            data: track_data,
+            media_duration,
+            stts: new_stts,
+            stsc: new_stsc,
+            stsz: new_stsz,
+            stss: new_stss,
+            ctts: new_ctts,
+        });
+    }
+    // Movie duration = longest track, scaled to the movie timescale.
+    let mut movie_duration = 0u64;
+    for c in &cuts {
+        let scaled = (c.media_duration as u128 * movie_timescale as u128
+            + c.trak.media_timescale as u128 / 2)
+            / c.trak.media_timescale as u128;
+        movie_duration = movie_duration.max(scaled as u64);
+    }
+    let mut patched = moov.to_vec();
+    {
+        let (s, e) = mvhd_span.content_range();
+        let body = &mut patched[s..e];
+        if mvhd_version == 1 {
+            patch_u64(body, 24, movie_duration)?;
+        } else {
+            patch_u32(body, 16, checked_u32(movie_duration, "movie duration overflow")?)?;
+        }
+    }
+    for c in &cuts {
+        let (s, e) = c.trak.mdhd.content_range();
+        let body = &mut patched[s..e];
+        if c.trak.mdhd_version == 1 {
+            patch_u64(body, 24, c.media_duration)?;
+        } else {
+            patch_u32(
+                body,
+                16,
+                checked_u32(c.media_duration, "media duration overflow")?,
+            )?;
+        }
+        let (s, e) = c.trak.tkhd.content_range();
+        let body = &mut patched[s..e];
+        if c.trak.tkhd_version == 1 {
+            patch_u64(body, 28, movie_duration)?;
+        } else {
+            patch_u32(body, 20, checked_u32(movie_duration, "track duration overflow")?)?;
+        }
+    }
+    // Two passes: measure the moov with placeholder offsets, then
+    // lay out one chunk per track.
+    let build_all = |offsets: &[u64]| -> Result<Vec<Vec<u8>>> {
+        let mut traks = Vec::with_capacity(cuts.len());
+        for (c, &off) in cuts.iter().zip(offsets) {
+            let mut repl: Vec<([u8; 4], Vec<u8>)> = vec![
+                (*b"stts", c.stts.clone()),
+                (*b"stsc", c.stsc.clone()),
+                (*b"stsz", c.stsz.clone()),
+                (
+                    if c.trak.chunk_offsets_64 { *b"co64" } else { *b"stco" },
+                    chunk_offset_box(c.trak.chunk_offsets_64, off)?,
+                ),
+            ];
+            if let Some(b) = &c.stss {
+                repl.push((*b"stss", b.clone()));
+            }
+            if let Some(b) = &c.ctts {
+                repl.push((*b"ctts", b.clone()));
+            }
+            let (ss, se) = c.trak.stbl.content_range();
+            let payload = splice(&patched[ss..se], &repl)?;
+            traks.push(rebuild_trak(&patched, c.trak_rel, make_box(b"stbl", &payload)?)?);
+        }
+        Ok(traks)
+    };
+    let assemble = |new_traks: Vec<Vec<u8>>| -> Result<Vec<u8>> {
+        let kids = scan_children(&patched)?;
+        let mut out = Vec::new();
+        let mut ti = 0usize;
+        for (typ, span) in kids {
+            if &typ == b"trak" {
+                out.extend_from_slice(new_traks.get(ti).ok_or_else(|| {
+                    parse_error("trak count mismatch")
+                })?);
+                ti += 1;
+            } else {
+                out.extend_from_slice(&patched[span.start..span.end]);
+            }
+        }
+        if ti != new_traks.len() {
+            return Err(parse_error("trak count mismatch"));
+        }
+        make_box(b"moov", &out)
+    };
+    let ftyp_len = ftyp.end - ftyp.start;
+    let zeros = vec![0u64; cuts.len()];
+    let moov_zero = assemble(build_all(&zeros)?)?;
+    let mut offsets = Vec::with_capacity(cuts.len());
+    let mut cursor = ftyp_len as u64 + moov_zero.len() as u64 + 8;
+    for c in &cuts {
+        offsets.push(cursor);
+        cursor += c.data.len() as u64;
+    }
+    let moov_final = assemble(build_all(&offsets)?)?;
+    let mut mdat_payload = Vec::new();
+    for c in &cuts {
+        mdat_payload.extend_from_slice(&c.data);
+    }
+    let new_mdat = make_box(b"mdat", &mdat_payload)?;
+    let mut out =
+        Vec::with_capacity(ftyp_len + moov_final.len() + new_mdat.len());
+    out.extend_from_slice(&data[ftyp.start..ftyp.end]);
+    out.extend_from_slice(&moov_final);
+    out.extend_from_slice(&new_mdat);
+    let _ = data.len();
+    Ok(out)
 }
     // Resolve the mdia/minf box spans as moov-absolute box spans
     // (content_range adds the header, so never re-wrap its output).
@@ -1353,14 +1655,136 @@ fn chunk_offset_box(wide: bool, chunk_offset: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Builds the PCM (`sowt`, s16le) audio `trak` for [`build_raw_mov`].
+fn audio_trak(chunk_offset: u32, a: &RawAudioParams, samples: u32) -> Result<Vec<u8>> {
+    let frame_bytes = 2 * a.channels as usize;
+    // stsd with one `sowt` entry.
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&[0u8; 8]); // size + fourcc filled below
+    entry.extend_from_slice(&[0u8; 6]); // reserved
+    entry.extend_from_slice(&1u16.to_be_bytes()); // dataref
+    entry.extend_from_slice(&0u16.to_be_bytes()); // version
+    entry.extend_from_slice(&0u16.to_be_bytes()); // revision
+    entry.extend_from_slice(&0u32.to_be_bytes()); // vendor
+    entry.extend_from_slice(&a.channels.to_be_bytes());
+    entry.extend_from_slice(&16u16.to_be_bytes()); // sample size
+    entry.extend_from_slice(&0u16.to_be_bytes()); // compression id
+    entry.extend_from_slice(&0u16.to_be_bytes()); // packet size
+    entry.extend_from_slice(&((a.sample_rate << 16) as u32).to_be_bytes()); // 16.16 rate
+    let entry_len = entry.len() as u32;
+    entry[0..4].copy_from_slice(&entry_len.to_be_bytes());
+    entry[4..8].copy_from_slice(b"sowt");
+    let mut stsd_payload = vec![0u8; 8];
+    stsd_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&entry);
+    let stsd_box = make_box(b"stsd", &stsd_payload)?;
+    let mut stts_payload = vec![0u8; 8];
+    stts_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stts_payload.extend_from_slice(&samples.to_be_bytes());
+    stts_payload.extend_from_slice(&1u32.to_be_bytes());
+    let stts_box = make_box(b"stts", &stts_payload)?;
+    let mut stsc_payload = vec![0u8; 8];
+    stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&samples.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    let stsc_box = make_box(b"stsc", &stsc_payload)?;
+    let mut stsz_payload = vec![0u8; 12];
+    stsz_payload[4..8].copy_from_slice(&(frame_bytes as u32).to_be_bytes());
+    stsz_payload[8..12].copy_from_slice(&samples.to_be_bytes());
+    let stsz_box = make_box(b"stsz", &stsz_payload)?;
+    let mut stco_payload = vec![0u8; 8];
+    stco_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stco_payload.extend_from_slice(&chunk_offset.to_be_bytes());
+    let stco_box = make_box(b"stco", &stco_payload)?;
+    let mut stbl_payload = Vec::new();
+    stbl_payload.extend_from_slice(&stsd_box);
+    stbl_payload.extend_from_slice(&stts_box);
+    stbl_payload.extend_from_slice(&stsc_box);
+    stbl_payload.extend_from_slice(&stsz_box);
+    stbl_payload.extend_from_slice(&stco_box);
+    let stbl_box = make_box(b"stbl", &stbl_payload)?;
+    // smhd / dinf / minf.
+    let smhd_box = make_box(b"smhd", &vec![0u8; 8])?;
+    let dinf_box = dref_self_contained()?;
+    let mut minf_payload = Vec::new();
+    minf_payload.extend_from_slice(&smhd_box);
+    minf_payload.extend_from_slice(&dinf_box);
+    minf_payload.extend_from_slice(&stbl_box);
+    let minf_box = make_box(b"minf", &minf_payload)?;
+    // mdhd (timescale = sample rate) / hdlr / mdia.
+    let mut mdhd_payload = vec![0u8; 24];
+    mdhd_payload[12..16].copy_from_slice(&a.sample_rate.to_be_bytes());
+    mdhd_payload[16..20].copy_from_slice(&samples.to_be_bytes());
+    mdhd_payload[20..22].copy_from_slice(&0x55C4u16.to_be_bytes());
+    let mdhd_box = make_box(b"mdhd", &mdhd_payload)?;
+    let mut hdlr_payload = vec![0u8; 8];
+    hdlr_payload.extend_from_slice(b"soun");
+    hdlr_payload.extend_from_slice(&[0u8; 12]);
+    hdlr_payload.extend_from_slice(b"SoundHandler\0");
+    let hdlr_box = make_box(b"hdlr", &hdlr_payload)?;
+    let mut mdia_payload = Vec::new();
+    mdia_payload.extend_from_slice(&mdhd_box);
+    mdia_payload.extend_from_slice(&hdlr_box);
+    mdia_payload.extend_from_slice(&minf_box);
+    let mdia_box = make_box(b"mdia", &mdia_payload)?;
+    let tkhd_box = tkhd_box(
+        2,
+        // tkhd runs on the movie timescale (600 here).
+        ((samples as u64 * 600 / a.sample_rate as u64) as u32),
+        0x100,
+        0,
+        0,
+    )?;
+    let mut trak_payload = Vec::new();
+    trak_payload.extend_from_slice(&tkhd_box);
+    trak_payload.extend_from_slice(&mdia_box);
+    make_box(b"trak", &trak_payload)
+}
+
 // ---------- Minimal raw RGB .mov writer (fixtures, capture targets) ----------
 
 /// Parameters for [`build_raw_mov`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RawMovParams {
     pub width: u16,
     pub height: u16,
     pub fps: u32,
+    pub audio: Option<RawAudioParams>,
+}
+
+/// PCM audio track parameters (s16le interleaved) for [`build_raw_mov`].
+#[derive(Debug, Clone)]
+pub struct RawAudioParams {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub pcm: Vec<u8>,
+}
+
+/// Builds a `tkhd` v0 box: version/flags, creation/modification,
+/// track id, duration (movie timescale), layer/group/volume,
+/// identity matrix, 16.16 dimensions.
+fn tkhd_box(track_id: u32, duration: u32, volume: u16, w: u32, h: u32) -> Result<Vec<u8>> {
+    let mut payload = vec![0u8; 84];
+    payload[12..16].copy_from_slice(&track_id.to_be_bytes());
+    payload[20..24].copy_from_slice(&duration.to_be_bytes());
+    payload[36..38].copy_from_slice(&volume.to_be_bytes());
+    payload[40..76].copy_from_slice(&identity_matrix());
+    payload[76..80].copy_from_slice(&(w << 16).to_be_bytes());
+    payload[80..84].copy_from_slice(&(h << 16).to_be_bytes());
+    make_box(b"tkhd", &payload)
+}
+
+fn dref_self_contained() -> Result<Vec<u8>> {
+    let mut url_entry = Vec::new();
+    url_entry.extend_from_slice(&12u32.to_be_bytes());
+    url_entry.extend_from_slice(b"url ");
+    url_entry.extend_from_slice(&[0u8, 0, 0, 1]);
+    let mut dref_payload = vec![0u8; 8];
+    dref_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    dref_payload.extend_from_slice(&url_entry);
+    let dref_box = make_box(b"dref", &dref_payload)?;
+    make_box(b"dinf", &dref_box)
 }
 
 fn identity_matrix() -> Vec<u8> {
@@ -1375,15 +1799,24 @@ fn identity_matrix() -> Vec<u8> {
 }
 
 /// Builds a minimal playable raw-RGB24 QuickTime `.mov` (faststart:
-/// ftyp + moov + single mdat, codec `raw `, one video track).
-/// Each frame must be exactly `width*height*3` bytes; `fps` must
-/// divide 600 evenly. Pure Rust, no dependencies.
+/// ftyp + moov + mdat, codec `raw `, one video track plus optional
+/// PCM `sowt` audio). Each frame must be exactly `width*height*3`
+/// bytes; `fps` must divide 600 evenly. Audio is s16le interleaved;
+/// the sample count is `pcm.len() / (2 * channels)`. Pure Rust.
 pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8>> {
     if params.width == 0 || params.height == 0 || frames.is_empty() {
         return Err(parse_error("empty raw mov"));
     }
     if params.fps == 0 || 600 % params.fps != 0 {
         return Err(parse_error("fps must divide 600"));
+    }
+    if let Some(a) = &params.audio {
+        if a.sample_rate == 0 || a.channels == 0 || a.pcm.is_empty() {
+            return Err(parse_error("bad raw audio params"));
+        }
+        if a.pcm.len() % (2 * a.channels as usize) != 0 {
+            return Err(parse_error("pcm size mismatch"));
+        }
     }
     let frame_size = params.width as usize * params.height as usize * 3;
     for f in frames {
@@ -1445,11 +1878,16 @@ pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8
     stsz_payload[4..8].copy_from_slice(&(frame_size as u32).to_be_bytes());
     stsz_payload[8..12].copy_from_slice(&n.to_be_bytes());
     let stsz_box = make_box(b"stsz", &stsz_payload)?;
-    // stco placeholder, fixed after moov size is known.
-    let build_moov = |chunk_offset: u32| -> Result<Vec<u8>> {
+    // Audio sample layout (single chunk, one sample per PCM frame).
+    let audio_samples: u32 = match &params.audio {
+        Some(a) => (a.pcm.len() / (2 * a.channels as usize)) as u32,
+        None => 0,
+    };
+    // stco placeholders, fixed after moov size is known.
+    let build_moov = |video_off: u32, audio_off: u32| -> Result<Vec<u8>> {
         let mut stco_payload = vec![0u8; 8];
         stco_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
-        stco_payload.extend_from_slice(&chunk_offset.to_be_bytes());
+        stco_payload.extend_from_slice(&video_off.to_be_bytes());
         let stco_box = make_box(b"stco", &stco_payload)?;
         let mut stbl_payload = Vec::new();
         stbl_payload.extend_from_slice(&stsd_box);
@@ -1462,15 +1900,7 @@ pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8
         let mut vmhd_payload = vec![0u8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         let _ = &mut vmhd_payload;
         let vmhd_box = make_box(b"vmhd", &vmhd_payload)?;
-        let mut url_entry = Vec::new();
-        url_entry.extend_from_slice(&12u32.to_be_bytes());
-        url_entry.extend_from_slice(b"url ");
-        url_entry.extend_from_slice(&[0u8, 0, 0, 1]);
-        let mut dref_payload = vec![0u8; 8];
-        dref_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
-        dref_payload.extend_from_slice(&url_entry);
-        let dref_box = make_box(b"dref", &dref_payload)?;
-        let dinf_box = make_box(b"dinf", &dref_box)?;
+        let dinf_box = dref_self_contained()?;
         let mut minf_payload = Vec::new();
         minf_payload.extend_from_slice(&vmhd_box);
         minf_payload.extend_from_slice(&dinf_box);
@@ -1492,18 +1922,16 @@ pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8
         mdia_payload.extend_from_slice(&hdlr_box);
         mdia_payload.extend_from_slice(&minf_box);
         let mdia_box = make_box(b"mdia", &mdia_payload)?;
-        // tkhd.
-        let mut tkhd_payload = vec![0u8; 84];
-        tkhd_payload[12..16].copy_from_slice(&1u32.to_be_bytes());
-        tkhd_payload[16..20].copy_from_slice(&duration.to_be_bytes());
-        tkhd_payload[44..80].copy_from_slice(&identity_matrix());
-        tkhd_payload[76..80].copy_from_slice(&((params.width as u32) << 16).to_be_bytes());
-        tkhd_payload[80..84].copy_from_slice(&((params.height as u32) << 16).to_be_bytes());
-        let tkhd_box = make_box(b"tkhd", &tkhd_payload)?;
+        let tkhd_box = tkhd_box(1, duration, 0, params.width as u32, params.height as u32)?;
         let mut trak_payload = Vec::new();
         trak_payload.extend_from_slice(&tkhd_box);
         trak_payload.extend_from_slice(&mdia_box);
         let trak_box = make_box(b"trak", &trak_payload)?;
+        let mut moov_payload = Vec::new();
+        moov_payload.extend_from_slice(&trak_box);
+        if let Some(a) = &params.audio {
+            moov_payload.extend_from_slice(&audio_trak(audio_off, a, audio_samples)?);
+        }
         // mvhd.
         let mut mvhd_payload = vec![0u8; 100];
         mvhd_payload[12..16].copy_from_slice(&600u32.to_be_bytes());
@@ -1511,19 +1939,26 @@ pub fn build_raw_mov(params: &RawMovParams, frames: &[Vec<u8>]) -> Result<Vec<u8
         mvhd_payload[20..24].copy_from_slice(&0x00010000u32.to_be_bytes());
         mvhd_payload[24..26].copy_from_slice(&0x0100u16.to_be_bytes());
         mvhd_payload[32..68].copy_from_slice(&identity_matrix());
-        mvhd_payload[96..100].copy_from_slice(&2u32.to_be_bytes());
+        let next_id = if params.audio.is_some() { 3u32 } else { 2u32 };
+        mvhd_payload[96..100].copy_from_slice(&next_id.to_be_bytes());
         let mvhd_box = make_box(b"mvhd", &mvhd_payload)?;
-        let mut moov_payload = Vec::new();
-        moov_payload.extend_from_slice(&mvhd_box);
-        moov_payload.extend_from_slice(&trak_box);
-        make_box(b"moov", &moov_payload)
+        let mut full = Vec::new();
+        full.extend_from_slice(&mvhd_box);
+        full.extend_from_slice(&moov_payload);
+        make_box(b"moov", &full)
     };
-    let moov_zero = build_moov(0)?;
-    let chunk_offset = (ftyp_box.len() + moov_zero.len() + 8) as u32;
-    let moov_box = build_moov(chunk_offset)?;
-    let mut mdat_payload = Vec::with_capacity(frames.iter().map(|f| f.len()).sum());
+    let video_bytes: usize = frames.iter().map(|f| f.len()).sum();
+    let audio_bytes: usize = params.audio.as_ref().map(|a| a.pcm.len()).unwrap_or(0);
+    let moov_zero = build_moov(0, 0)?;
+    let video_off = (ftyp_box.len() + moov_zero.len() + 8) as u32;
+    let audio_off = video_off + video_bytes as u32;
+    let moov_box = build_moov(video_off, audio_off)?;
+    let mut mdat_payload = Vec::with_capacity(video_bytes + audio_bytes);
     for f in frames {
         mdat_payload.extend_from_slice(f);
+    }
+    if let Some(a) = &params.audio {
+        mdat_payload.extend_from_slice(&a.pcm);
     }
     let mdat_box = make_box(b"mdat", &mdat_payload)?;
     let mut out = Vec::with_capacity(ftyp_box.len() + moov_box.len() + mdat_box.len());
@@ -1648,6 +2083,7 @@ mod tests {
             width: 4,
             height: 2,
             fps: 10,
+            audio: None,
         };
         let body: Vec<Vec<u8>> = (0..frames)
             .map(|f| vec![f as u8; 4 * 2 * 3])
@@ -1695,5 +2131,56 @@ mod tests {
         let file = raw_fixture(10);
         assert!(trim_mov_bytes(&file, 5.0, 6.0).is_err());
         assert!(trim_mov_bytes(&file, 0.5, 0.5).is_err());
+    }
+
+    fn av_fixture() -> Vec<u8> {
+        // 10 video frames @10fps + 1s of 8kHz mono s16le (ramp bytes).
+        let params = RawMovParams {
+            width: 4,
+            height: 2,
+            fps: 10,
+            audio: Some(RawAudioParams {
+                sample_rate: 8000,
+                channels: 1,
+                pcm: (0..16000u32).map(|i| (i % 256) as u8).collect(),
+            }),
+        };
+        let body: Vec<Vec<u8>> = (0..10).map(|f| vec![f as u8; 4 * 2 * 3]).collect();
+        build_raw_mov(&params, &body).unwrap()
+    }
+
+    #[test]
+    fn av_fixture_has_two_tracks() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-av-{}.mov", std::process::id()));
+        std::fs::write(&path, av_fixture()).unwrap();
+        let info = read_mov_info(&path).unwrap();
+        assert_eq!((info.width, info.height), (4, 2));
+        assert_eq!(info.video_fourcc, "raw ");
+        assert_eq!(info.audio_fourcc.as_deref(), Some("sowt"));
+        assert!((info.duration_secs - 1.0).abs() < 0.001);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_trim_keeps_av_sync() {
+        let file = av_fixture();
+        // [0.2, 0.5): video frames 2,3,4 + audio samples 1600..3999.
+        let out = trim_mov_bytes(&file, 0.2, 0.5).unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-avtrim-{}.mov", std::process::id()));
+        std::fs::write(&path, &out).unwrap();
+        let info = read_mov_info(&path).unwrap();
+        assert!((info.duration_secs - 0.3).abs() < 0.001);
+        assert_eq!(info.audio_fourcc.as_deref(), Some("sowt"));
+        // Audio payload must start at original sample 1600 (byte 3200).
+        let top = scan_children(&out).unwrap();
+        let mdat = top.iter().find(|(t, _)| t == b"mdat").unwrap().1;
+        let (s, _) = mdat.content_range();
+        let video_bytes = 3 * 24;
+        let first_audio = &out[s + video_bytes..s + video_bytes + 8];
+        let expect: Vec<u8> = (3200..3208u32).map(|i| (i % 256) as u8).collect();
+        assert_eq!(first_audio, &expect[..]);
+        let _ = std::fs::remove_file(&path);
     }
 }
