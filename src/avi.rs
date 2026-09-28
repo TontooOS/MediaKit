@@ -409,6 +409,91 @@ pub fn read_avi_info(path: &Path) -> Result<AviInfo> {
     Ok(info)
 }
 
+/// One `movi` chunk: stream number (`00` in `00dc`), kind
+/// (`dc` video, `wb` audio, `db` RGB) and file location.
+/// Backs native thumbnails without ffmpeg.
+#[derive(Debug, Clone)]
+pub struct AviChunk {
+    pub stream: u16,
+    pub kind: String,
+    pub offset: u64,
+    pub size: u32,
+}
+
+/// Lists `movi` chunks (bounded, seek-based, payloads untouched).
+/// Stops after `cap` chunks; OpenDML `AVIX` lists are skipped in v1.
+pub fn read_avi_chunks(path: &Path, cap: usize) -> Result<Vec<AviChunk>> {
+    let meta = std::fs::metadata(path).map_err(MediaError::from_io)?;
+    let file_len = meta.len();
+    let mut f = File::open(path).map_err(MediaError::from_io)?;
+    let mut head = [0u8; 12];
+    f.read_exact(&mut head).map_err(MediaError::from_io)?;
+    if !is_avi_bytes(&head) {
+        return Err(parse_error("not riff/avi"));
+    }
+    let cap = cap.min(1_000_000).max(1);
+    let mut out = Vec::new();
+    let mut pos = 12u64;
+    let mut header = [0u8; 8];
+    let mut top_count = 0usize;
+    while pos + 8 <= file_len && out.len() < cap {
+        top_count += 1;
+        if top_count > MAX_CHUNKS {
+            break;
+        }
+        f.seek(SeekFrom::Start(pos)).map_err(MediaError::from_io)?;
+        f.read_exact(&mut header).map_err(MediaError::from_io)?;
+        let id = [header[0], header[1], header[2], header[3]];
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+        let total = 8u64
+            .checked_add(size)
+            .and_then(|v| v.checked_add(size & 1))
+            .ok_or_else(|| parse_error("chunk size overflow"))?;
+        if &id == b"LIST" {
+            let mut ltype = [0u8; 4];
+            f.read_exact(&mut ltype).map_err(MediaError::from_io)?;
+            if &ltype == b"movi" && size >= 4 {
+                let mut inner = pos + 12;
+                let end = pos + 8 + size;
+                while inner + 8 <= end && inner + 8 <= file_len && out.len() < cap {
+                    f.seek(SeekFrom::Start(inner)).map_err(MediaError::from_io)?;
+                    f.read_exact(&mut header).map_err(MediaError::from_io)?;
+                    let cid = [header[0], header[1], header[2], header[3]];
+                    let csize =
+                        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+                    let ctotal = 8u64
+                        .checked_add(csize)
+                        .and_then(|v| v.checked_add(csize & 1))
+                        .ok_or_else(|| parse_error("chunk size overflow"))?;
+                    if inner + ctotal > file_len + 1 {
+                        break;
+                    }
+                    let tag = String::from_utf8_lossy(&cid).to_string();
+                    let stream = tag
+                        .get(0..2)
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(u16::MAX);
+                    let kind = tag.get(2..4).unwrap_or("??").to_string();
+                    if stream != u16::MAX {
+                        out.push(AviChunk {
+                            stream,
+                            kind,
+                            offset: inner + 8,
+                            size: csize.min(u32::MAX as u64) as u32,
+                        });
+                    }
+                    inner += ctotal;
+                }
+            }
+        }
+        pos += total;
+        if pos >= file_len {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// Converts native `AviInfo` into the shared `VideoMetadata` shape.
 pub fn avi_to_metadata(info: &AviInfo, path: &Path) -> VideoMetadata {
     let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
@@ -545,5 +630,20 @@ mod tests {
     fn rejects_non_avi() {
         assert!(parse_avi_bytes(b"RIFF\x08\x00\x00\x00WEBPVP8 data....").is_err());
         assert!(parse_avi_bytes(b"too short").is_err());
+    }
+
+    #[test]
+    fn lists_movi_chunks() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-avichunk-{}.avi", std::process::id()));
+        std::fs::write(&path, sample_avi()).unwrap();
+        let chunks = read_avi_chunks(&path, 64).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].stream, 0);
+        assert_eq!(chunks[0].kind, "dc");
+        assert_eq!(chunks[1].stream, 1);
+        assert_eq!(chunks[1].kind, "wb");
+        assert!(chunks[0].size == 8 && chunks[1].size == 4);
+        let _ = std::fs::remove_file(&path);
     }
 }

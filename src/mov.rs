@@ -623,7 +623,6 @@ struct ParsedTrak {
     mdhd_version: u8,
     media_timescale: u32,
     stbl: Span,
-    stsd_box: Vec<u8>,
     stts: Vec<SttsRun>,
     stsc: Vec<(u32, u32, u32)>,
     stsz_uniform: u32,
@@ -634,7 +633,6 @@ struct ParsedTrak {
     ctts_version: Option<u8>,
     ctts: Vec<(u32, i64)>,
     video_fourcc: String,
-    stbl_kids: Vec<([u8; 4], Span)>,
 }
 
 fn parse_stts_body(body: &[u8]) -> Result<Vec<SttsRun>> {
@@ -903,21 +901,16 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
     };
     let stsd_span = get(b"stsd")?;
     let (ts, te) = stsd_span.content_range();
-    let stsd_box = moov[ts..te].to_vec();
     // Video fourcc = first sample entry.
     let mut video_fourcc = String::new();
-    if stsd_box.len() >= 16 {
-        video_fourcc = fourcc(&stsd_box[12..16]);
+    if te - ts >= 16 {
+        video_fourcc = fourcc(&moov[ts + 12..ts + 16]);
     }
-    let stbl_kids_abs: Vec<([u8; 4], Span)> = stbl_kids
-        .iter()
-        .map(|(t, s)| (*t, abs_span(ss, *s)))
-        .collect();
     let body_of = |name: &[u8; 4]| -> Result<Vec<u8>> {
-        let s = stbl_kids_abs
+        let s = stbl_kids
             .iter()
             .find(|(t, _)| t == name)
-            .map(|(_, s)| *s)
+            .map(|(_, s)| abs_span(ss, *s))
             .ok_or_else(|| parse_error("stbl missing box"))?;
         let (a, b) = s.content_range();
         Ok(moov[a..b].to_vec())
@@ -925,24 +918,26 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
     let stts = parse_stts_body(&body_of(b"stts")?)?;
     let stsc = parse_stsc_body(&body_of(b"stsc")?)?;
     let (stsz_uniform, stsz_table) = parse_stsz_body(&body_of(b"stsz")?)?;
-    let has_stco = stbl_kids_abs.iter().any(|(t, _)| t == b"stco");
-    let has_co64 = stbl_kids_abs.iter().any(|(t, _)| t == b"co64");
+    let has_stco = stbl_kids.iter().any(|(t, _)| t == b"stco");
+    let has_co64 = stbl_kids.iter().any(|(t, _)| t == b"co64");
     let (wide, off_body) = match (has_stco, has_co64) {
         (true, false) => (false, body_of(b"stco")?),
         (false, true) => (true, body_of(b"co64")?),
         _ => return Err(parse_error("need exactly one stco/co64")),
     };
     let chunk_offsets = parse_offset_table(&off_body, wide)?;
-    let stss = match stbl_kids_abs.iter().find(|(t, _)| t == b"stss") {
+    let stss = match stbl_kids.iter().find(|(t, _)| t == b"stss") {
         Some((_, s)) => {
-            let (a, b) = s.content_range();
+            let abs = abs_span(ss, *s);
+            let (a, b) = abs.content_range();
             Some(parse_stss_body(&moov[a..b])?)
         }
         None => None,
     };
-    let (ctts_version, ctts) = match stbl_kids_abs.iter().find(|(t, _)| t == b"ctts") {
+    let (ctts_version, ctts) = match stbl_kids.iter().find(|(t, _)| t == b"ctts") {
         Some((_, s)) => {
-            let (a, b) = s.content_range();
+            let abs = abs_span(ss, *s);
+            let (a, b) = abs.content_range();
             let (v, runs) = parse_ctts_body(&moov[a..b])?;
             (Some(v), runs)
         }
@@ -973,21 +968,19 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
         tkhd_version: tkhd_body[0],
         mdhd,
         mdhd_version,
-        media_timescale,
-        stbl: stbl_abs,
-        stsd_box,
-        stts,
-        stsc,
-        stsz_uniform,
-        stsz_table,
-        chunk_offsets_64: wide,
-        chunk_offsets,
-        stss,
-        ctts_version,
-        ctts,
-        video_fourcc,
-        stbl_kids: stbl_kids_abs,
-    })
+    media_timescale,
+    stbl: stbl_abs,
+    stts,
+    stsc,
+    stsz_uniform,
+    stsz_table,
+    chunk_offsets_64: wide,
+    chunk_offsets,
+    stss,
+    ctts_version,
+    ctts,
+    video_fourcc,
+})
 }
 
 #[derive(Debug, Clone)]
@@ -1731,7 +1724,7 @@ fn audio_trak(chunk_offset: u32, a: &RawAudioParams, samples: u32) -> Result<Vec
     let tkhd_box = tkhd_box(
         2,
         // tkhd runs on the movie timescale (600 here).
-        ((samples as u64 * 600 / a.sample_rate as u64) as u32),
+        (samples as u64 * 600 / a.sample_rate as u64) as u32,
         0x100,
         0,
         0,
@@ -1740,6 +1733,63 @@ fn audio_trak(chunk_offset: u32, a: &RawAudioParams, samples: u32) -> Result<Vec
     trak_payload.extend_from_slice(&tkhd_box);
     trak_payload.extend_from_slice(&mdia_box);
     make_box(b"trak", &trak_payload)
+}
+
+/// One media sample of the first video track: file offset, size
+/// and presentation time. Backs native thumbnails and the future
+/// WGPU frame provider without ffmpeg.
+#[derive(Debug, Clone)]
+pub struct MovSample {
+    pub codec_fourcc: String,
+    pub offset: u64,
+    pub size: u32,
+    pub pts_secs: f64,
+    pub duration_secs: f64,
+}
+
+/// Reads the samples of the first video track (`stbl` order).
+/// Files over 512 MB return `ParseError`.
+pub fn read_mov_samples(path: &Path) -> Result<Vec<MovSample>> {
+    let data = std::fs::read(path).map_err(MediaError::from_io)?;
+    if data.len() > MAX_MOV_FILE_SIZE {
+        return Err(parse_error("file too large"));
+    }
+    let top = scan_children(&data)?;
+    let moov_span = top
+        .iter()
+        .find(|(t, _)| t == b"moov")
+        .map(|(_, s)| *s)
+        .ok_or_else(|| parse_error("missing moov"))?;
+    let (ms, me) = moov_span.content_range();
+    let moov = &data[ms..me];
+    let moov_kids = scan_children(moov)?;
+    let mut first_video: Option<(Span, ParsedTrak)> = None;
+    for (typ, span) in &moov_kids {
+        if typ != b"trak" {
+            continue;
+        }
+        let trak = parse_trak_tables(moov, *span)?;
+        if trak.handler == "vide" {
+            first_video = Some((*span, trak));
+            break;
+        }
+    }
+    let (_, trak) = first_video.ok_or_else(|| parse_error("no video track"))?;
+    let samples = expand_samples(&trak)?;
+    let ts = trak.media_timescale as f64;
+    let mut time = 0u64;
+    let mut out = Vec::with_capacity(samples.deltas.len());
+    for i in 0..samples.deltas.len() {
+        out.push(MovSample {
+            codec_fourcc: trak.video_fourcc.clone(),
+            offset: samples.offsets[i],
+            size: samples.sizes[i],
+            pts_secs: time as f64 / ts,
+            duration_secs: samples.deltas[i] as f64 / ts,
+        });
+        time += samples.deltas[i] as u64;
+    }
+    Ok(out)
 }
 
 // ---------- Minimal raw RGB .mov writer (fixtures, capture targets) ----------

@@ -23,6 +23,7 @@ dependency.
 | Editing | [Editing.md](Editing.md) | Trim, concat and transcode via ffmpeg |
 | Mkv | [Mkv.md](Mkv.md) | Native `.mkv`/`.webm` parser, metadata and chapters fallback |
 | Avi | [Avi.md](Avi.md) | Native `.avi` parser, metadata and chapters fallback |
+| Mjpeg | [Mjpeg.md](Mjpeg.md) | Native baseline MJPEG decoder and fixture encoder |
 | ProRes | [ProRes.md](ProRes.md) | Native `.mov` parser and ProRes profiles plus GPU slice plan |
 | Devices | [Devices.md](Devices.md) | Camera and video-output listing |
 | Controls | [Controls.md](Controls.md) | SF Symbols via CoreIcon, SF Pro via CoreText, theme colors |
@@ -45,6 +46,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: Native pixel pipeline (`mjpeg`, `png_mini`, `extract_frame_native`, mov/avi samples).
 - 2026-09-27: Audio track support (PCM `sowt` writer, multi-track native trim).
 - 2026-09-27: Native AVI support (`avi`, metadata, chapters, FFI).
 - 2026-09-27: WebM proven native (VP9/Opus fixture, same `mkv` path).

@@ -9,9 +9,11 @@ pub mod error;
 pub mod format;
 pub mod lang;
 pub mod metadata;
+pub mod mjpeg;
 pub mod mkv;
 pub mod mov;
 pub mod playback;
+pub mod png_mini;
 pub mod prores;
 pub mod prores_blocks;
 pub mod prores_frame;
@@ -20,7 +22,7 @@ pub mod subtitles;
 pub mod thumbnails;
 
 pub use audio::{is_system_muted, set_system_muted, set_system_volume, system_volume};
-pub use avi::{avi_to_metadata, is_avi_extension, read_avi_info, read_avi_metadata, sniff_avi, AviInfo};
+pub use avi::{avi_to_metadata, is_avi_extension, read_avi_chunks, read_avi_info, read_avi_metadata, sniff_avi, AviChunk, AviInfo};
 pub use capture::{list_cameras, snapshot, start_capture, CameraDevice, CameraKind, CaptureFormat, CaptureQuality};
 pub use chapters::{read_chapters, Chapter, ChapterList};
 pub use controls::{transport_bar, ControlDescriptor, ControlIcon};
@@ -29,9 +31,11 @@ pub use edit::{concat, transcode, transcode_prores, trim, trim_mov_native, Expor
 pub use error::{MediaError, Result};
 pub use format::{is_supported, probe_container, probe_container_native, VideoContainer, MOV_EXTENSIONS, SUPPORTED_EXTENSIONS};
 pub use metadata::{read_metadata, VideoMetadata};
+pub use mjpeg::{decode_jpeg, encode_jpeg_fixture, JpegError, JpegImage, JpegSampling};
 pub use mkv::{is_mkv_extension, read_mkv_info, read_mkv_metadata, sniff_mkv, MkvInfo};
-pub use mov::{build_raw_mov, is_mov_extension, read_mov_info, read_mov_metadata, sniff_mov, MovInfo, RawAudioParams, RawMovParams};
+pub use mov::{build_raw_mov, is_mov_extension, read_mov_info, read_mov_metadata, read_mov_samples, sniff_mov, MovInfo, MovSample, RawAudioParams, RawMovParams};
 pub use playback::{DisplayMode, PlaybackState, VideoPlayer, MAX_SPEED, MIN_SPEED};
+pub use png_mini::{adler32, crc32, decode_png_stored, encode_png_rgb};
 pub use prores::{
     detect_profile_from_mov, gpu_slice_plan, is_prores_fourcc, parse_frame_header,
     profile_from_fourcc, ProResChroma, ProResFrameHeader, ProResProfile, PRORES_FOURCCS,
@@ -46,7 +50,7 @@ pub use prores_frame::{
 };
 pub use streaming::{detect_kind, fetch_hls_playlist, fetch_progressive, fetch_segment, BufferState, HlsPlaylist, StreamEvent, StreamKind};
 pub use subtitles::{SubtitleCue, SubtitleTrack};
-pub use thumbnails::{extract_args, extract_frame};
+pub use thumbnails::{extract_args, extract_frame, extract_frame_native};
 
 /// Shared handle to the video domains (mirrors NetworkKit/AudioKit facades).
 #[derive(Debug, Default)]
