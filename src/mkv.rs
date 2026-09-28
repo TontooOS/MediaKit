@@ -4,10 +4,9 @@
 //! `EBML` header, `Info` and `Tracks`, then scans cluster timestamps
 //! for a duration fallback. No ffmpeg/ffprobe dependency.
 //!
-//! Coverage is the metadata subset MediaKit needs 1:1: duration,
+//! Coverage is the metadata subset MediaKit needs: duration,
 //! resolution, video/audio codec IDs and a framerate estimate from
-//! `DefaultDuration`. Lossless trimming stays on the ffmpeg path
-//! until native sample-table surgery lands for EBML.
+//! `DefaultDuration`. Sample editing for EBML is a later milestone.
 
 use crate::error::{MediaError, Result};
 use crate::metadata::VideoMetadata;
