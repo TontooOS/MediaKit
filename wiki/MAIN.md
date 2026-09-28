@@ -44,6 +44,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: WebM proven native (VP9/Opus fixture, same `mkv` path).
 - 2026-09-27: Native Matroska/WebM support (`mkv`, metadata, chapters, FFI).
 - 2026-09-27: Native ProRes decode TDC-1 subset (`prores_blocks`, `prores_frame`, 14 tests).
 - 2026-09-27: Native lossless `.mov` trim (`trim_mov_native`), raw `.mov` writer (`build_raw_mov`).

@@ -542,10 +542,15 @@ mod tests {
     }
 
     fn sample_mkv() -> Vec<u8> {
-        let ebml = el(
-            ID_EBML,
-            &[str_el(ID_DOCTYPE, "matroska")].concat(),
-        );
+        sample_matroska("matroska", "V_MPEG4/ISO/AVC", "A_AAC")
+    }
+
+    fn sample_webm() -> Vec<u8> {
+        sample_matroska("webm", "V_VP9", "A_OPUS")
+    }
+
+    fn sample_matroska(doctype: &str, vcodec: &str, acodec: &str) -> Vec<u8> {
+        let ebml = el(ID_EBML, &[str_el(ID_DOCTYPE, doctype)].concat());
         let info = el(
             ID_INFO,
             &[
@@ -559,7 +564,7 @@ mod tests {
             &[
                 uint_el(ID_TRACK_NUMBER, 1),
                 uint_el(ID_TRACK_TYPE, 1),
-                str_el(ID_CODEC_ID, "V_MPEG4/ISO/AVC"),
+                str_el(ID_CODEC_ID, vcodec),
                 uint_el(ID_DEFAULT_DURATION, 41_666_666),
                 el(
                     ID_VIDEO,
@@ -574,7 +579,7 @@ mod tests {
             &[
                 uint_el(ID_TRACK_NUMBER, 2),
                 uint_el(ID_TRACK_TYPE, 2),
-                str_el(ID_CODEC_ID, "A_AAC"),
+                str_el(ID_CODEC_ID, acodec),
             ]
             .concat(),
         );
@@ -639,6 +644,20 @@ mod tests {
         let info = parse_mkv_bytes(&file).unwrap();
         // One cluster at ts 0 + one frame of padding (~1/24s).
         assert!(info.duration_secs > 0.0 && info.duration_secs < 1.0);
+    }
+
+    #[test]
+    fn parses_webm_doctype() {
+        let file = sample_webm();
+        assert!(is_mkv_bytes(&file));
+        let info = parse_mkv_bytes(&file).unwrap();
+        assert_eq!(info.doctype, "webm");
+        assert_eq!(info.container_name(), "webm");
+        assert!((info.duration_secs - 6.0).abs() < 0.01);
+        assert_eq!((info.width, info.height), (1280, 720));
+        assert_eq!(info.video_codec, "V_VP9");
+        assert_eq!(info.audio_codec.as_deref(), Some("A_OPUS"));
+        assert!(is_mkv_extension("webm"));
     }
 
     #[test]
