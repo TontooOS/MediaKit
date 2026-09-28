@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod avi;
 pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod capture_v4l2;
 pub mod chapters;
 pub mod controls;
 pub mod devices;
@@ -24,6 +26,11 @@ pub mod thumbnails;
 pub use audio::{is_system_muted, set_system_muted, set_system_volume, system_volume};
 pub use avi::{avi_to_metadata, is_avi_extension, read_avi_chunks, read_avi_info, read_avi_metadata, sniff_avi, AviChunk, AviInfo};
 pub use capture::{list_cameras, snapshot, start_capture, CameraDevice, CameraKind, CaptureFormat, CaptureQuality};
+#[cfg(target_os = "linux")]
+pub use capture_v4l2::{
+    capture_frame_native, capture_still_native, yuyv_to_rgb, CapturedFrame, FOURCC_MJPG,
+    FOURCC_YUYV,
+};
 pub use chapters::{read_chapters, Chapter, ChapterList};
 pub use controls::{transport_bar, ControlDescriptor, ControlIcon};
 pub use devices::{available_cameras, available_outputs, VideoOutput};
@@ -50,7 +57,7 @@ pub use prores_frame::{
 };
 pub use streaming::{detect_kind, fetch_hls_playlist, fetch_progressive, fetch_segment, BufferState, HlsPlaylist, StreamEvent, StreamKind};
 pub use subtitles::{SubtitleCue, SubtitleTrack};
-pub use thumbnails::{extract_args, extract_frame, extract_frame_native};
+pub use thumbnails::{decode_video_frame, extract_args, extract_frame, extract_frame_native, NativeFrame};
 
 /// Shared handle to the video domains (mirrors NetworkKit/AudioKit facades).
 #[derive(Debug, Default)]

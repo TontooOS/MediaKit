@@ -182,8 +182,18 @@ impl VideoPlayer {
         }
     }
 
-    /// Spawns `mpv` (or `ffplay` fallback) for real output. Optional;
-    /// headless tests never call this.
+    /// Decodes the frame at `position_secs` to CPU-side RGB24 with
+    /// pure Rust (no player binary). This is the native playback
+    /// path: apps upload `NativeFrame.rgb` to a WGPU texture.
+    /// Seeks are exact (sample PTS), independent of `seek`.
+    pub fn frame_at(&self, position_secs: f64) -> Result<crate::thumbnails::NativeFrame> {
+        let path = self.path.as_deref().ok_or(MediaError::NotAvailable)?;
+        crate::thumbnails::decode_video_frame(path, position_secs)
+    }
+
+    /// Spawns `mpv` (or `ffplay` fallback) for real output.
+    /// Legacy path: prefer `frame_at` + WGPU upload, which needs no
+    /// external binary. Headless tests never call this.
     pub fn spawn_external(&mut self) -> Result<()> {
         let path = self.path.clone().ok_or(MediaError::NotAvailable)?;
         let attempt = try_spawn(&path, self.speed, self.display);
@@ -286,5 +296,35 @@ mod tests {
         let mut p = VideoPlayer::new();
         assert_eq!(p.toggle_fullscreen(), DisplayMode::Fullscreen);
         assert_eq!(p.toggle_fullscreen(), DisplayMode::Windowed);
+    }
+
+    #[test]
+    fn frame_at_needs_open_file() {
+        let p = VideoPlayer::new();
+        assert!(p.frame_at(1.0).is_err());
+    }
+
+    #[test]
+    fn frame_at_decodes_raw_mov() {
+        use crate::mov::{build_raw_mov, RawMovParams};
+        let params = RawMovParams {
+            width: 8,
+            height: 4,
+            fps: 10,
+            audio: None,
+        };
+        let body: Vec<Vec<u8>> = (0..10).map(|f| vec![f as u8; 8 * 4 * 3]).collect();
+        let file = build_raw_mov(&params, &body).unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-frameat-{}.mov", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let mut p = VideoPlayer::new();
+        p.open(&path).unwrap();
+        // 0.25s -> frame 2, pts 0.2.
+        let frame = p.frame_at(0.25).unwrap();
+        assert_eq!((frame.width, frame.height), (8, 4));
+        assert!((frame.pts_secs - 0.2).abs() < 0.001);
+        assert!(frame.rgb.iter().all(|&b| b == 2));
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -46,6 +46,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: ffmpeg-free playback + capture (`decode_video_frame`, `frame_at`, native V4L2).
 - 2026-09-27: Native pixel pipeline (`mjpeg`, `png_mini`, `extract_frame_native`, mov/avi samples).
 - 2026-09-27: Audio track support (PCM `sowt` writer, multi-track native trim).
 - 2026-09-27: Native AVI support (`avi`, metadata, chapters, FFI).

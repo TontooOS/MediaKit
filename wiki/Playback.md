@@ -4,6 +4,32 @@ File playback (MP4, WebM, MKV, AVI) with Play, Pause, Stop, Seek, speed
 control, fullscreen switching, subtitles and chapters. Volume and mute
 are delegated to AudioKit instead of being reimplemented.
 
+Two output paths exist: the native frame provider (`frame_at`,
+no binaries) and the legacy external player (`spawn_external`
+with `mpv`/`ffplay`).
+
+## Native frames
+
+```rust
+pub fn frame_at(&self, position_secs: f64) -> Result<NativeFrame>
+```
+
+- Decodes the frame at `position_secs` to CPU-side RGB24 via
+  `decode_video_frame` (raw, TDC-1, MJPEG for MOV; MJPEG/RGB
+  for AVI).
+- Seeks are exact (sample PTS) and independent of `seek`.
+- Apps upload `NativeFrame.rgb` to a WGPU texture.
+- Returns `Err(MediaError::NotAvailable)` with no open file.
+
+### `NativeFrame`
+
+| Field | Type | Description |
+|---|---|---|
+| `width` | `u32` | Frame width in pixels |
+| `height` | `u32` | Frame height in pixels |
+| `pts_secs` | `f64` | Presentation timestamp |
+| `rgb` | `Vec<u8>` | Packed RGB24 |
+
 ## VideoPlayer
 
 Core transport state. Real output spawns `mpv` (preferred) or `ffplay`

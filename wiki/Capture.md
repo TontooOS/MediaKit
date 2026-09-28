@@ -45,6 +45,29 @@ let pid = mediakit::start_capture(
   1920x1080 (High, FullHd).
 - `CaptureFormat` selects the output extension (Mp4, WebM, Mkv).
 
+## Native stills (no ffmpeg, Linux only)
+
+```rust
+let frame = mediakit::capture_still_native(&cameras[0].node)?;
+```
+
+- Drives `/dev/videoN` with raw ioctls (no libc crate):
+  `QUERYCAP`, `S_FMT`, `STREAMON`, blocking `read()`, `STREAMOFF`.
+- Prefers MJPEG 1280x720 (decoded by `Mjpeg.md`), falls back to
+  YUYV 640x480 (converted in-crate).
+- `capture_frame_native(node, width, height, fourcc)` takes
+  `FOURCC_MJPG` or `FOURCC_YUYV`; the driver may adjust the size
+  (reported back in `CapturedFrame`).
+- Needs real hardware; without a camera it returns `Err`.
+
+### `CapturedFrame`
+
+| Field | Type | Description |
+|---|---|---|
+| `width` | `u32` | Negotiated width in pixels |
+| `height` | `u32` | Negotiated height in pixels |
+| `rgb` | `Vec<u8>` | Packed RGB24 |
+
 ## Snapshots
 
 ```rust
