@@ -92,17 +92,22 @@ struct FfChapter {
 }
 
 /// Reads chapters via `ffprobe -show_chapters`.
-/// Valid `.mov`/`.mkv` files return an (empty) native list when
-/// ffprobe is missing so they behave 1:1 offline.
+/// Valid `.mov`/`.mkv`/`.avi` files return an (empty) native list
+/// when ffprobe is missing so they behave 1:1 offline.
 pub fn read_chapters(path: &std::path::Path) -> Result<ChapterList> {
     let native_valid = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| crate::mov::is_mov_extension(e) || crate::mkv::is_mkv_extension(e))
+        .map(|e| {
+            crate::mov::is_mov_extension(e)
+                || crate::mkv::is_mkv_extension(e)
+                || crate::avi::is_avi_extension(e)
+        })
         .unwrap_or(false)
         && path.exists()
         && (crate::mov::read_mov_info(path).is_ok()
-            || crate::mkv::read_mkv_info(path).is_ok());
+            || crate::mkv::read_mkv_info(path).is_ok()
+            || crate::avi::read_avi_info(path).is_ok());
     let out = match Command::new("ffprobe")
         .args([
             "-v",

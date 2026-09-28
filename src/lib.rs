@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod avi;
 pub mod capture;
 pub mod chapters;
 pub mod controls;
@@ -19,6 +20,7 @@ pub mod subtitles;
 pub mod thumbnails;
 
 pub use audio::{is_system_muted, set_system_muted, set_system_volume, system_volume};
+pub use avi::{avi_to_metadata, is_avi_extension, read_avi_info, read_avi_metadata, sniff_avi, AviInfo};
 pub use capture::{list_cameras, snapshot, start_capture, CameraDevice, CameraKind, CaptureFormat, CaptureQuality};
 pub use chapters::{read_chapters, Chapter, ChapterList};
 pub use controls::{transport_bar, ControlDescriptor, ControlIcon};

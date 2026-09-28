@@ -69,6 +69,11 @@ pub fn read_metadata(path: &Path) -> Result<VideoMetadata> {
                     return Ok(meta);
                 }
                 // Fall through to ffprobe for damaged/partial files.
+            } else if crate::avi::is_avi_extension(ext) {
+                if let Ok(meta) = crate::avi::read_avi_metadata(path) {
+                    return Ok(meta);
+                }
+                // Fall through to ffprobe for damaged/partial files.
             }
         }
     }
