@@ -68,16 +68,6 @@ pub fn gpu_slice_plan(width: u32, height: u32, slices: u16) -> Vec<(u32, u32)>
 | `FourFourFourFour` | `ap4h`, 4:4:4, alpha |
 | `FourFourFourFourXq` | `ap4x`, 4:4:4, alpha |
 
-## `transcode_prores`
-
-```rust
-pub fn transcode_prores(input: &Path, output: &Path, profile: ProResProfile) -> Result<()>
-```
-
-- Validates `input` via `probe_container` first.
-- Executes via ffmpeg `prores_ks` until the native GPU encoder lands.
-- Returns `Err` for unsupported inputs or failed encodes.
-
 ## Native decode (TDC-1 subset)
 
 Pure-Rust ProRes decode without ffmpeg: Rice bitstream
@@ -141,5 +131,5 @@ let profile = profile_from_fourcc(&info.video_fourcc);
 
 - [Metadata.md](Metadata.md) – native MOV metadata path
 - [Playback.md](Playback.md) – `.mov` opens offline
-- [Editing.md](Editing.md) – ProRes transcode targets, native trim
+- [Editing.md](Editing.md) – native trim and concat
 - [Ffi.md](Ffi.md) – `tontoo_mediakit_mov_info` JSON

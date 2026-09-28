@@ -1,9 +1,9 @@
 # MediaKit – Wiki
 
-MediaKit is the video framework for TontooOS. It covers file playback,
-camera capture, network streaming, metadata, thumbnails and basic editing
-on top of ffmpeg, V4L2, NetworkKit and AudioKit, without any cloud
-dependency.
+MediaKit is the video framework for TontooOS. It covers native file
+parsing, decode, camera capture, network streaming, metadata,
+thumbnails and lossless editing with pure Rust and no external
+binaries, without any cloud dependency.
 
 - Repository: https://github.com/TontooOS/Libs
 - License: TCL
@@ -18,9 +18,9 @@ dependency.
 | Playback | [Playback.md](Playback.md) | `VideoPlayer` file playback, speed, fullscreen, subtitles, chapters |
 | Capture | [Capture.md](Capture.md) | Camera access, recording, quality selection, snapshots |
 | Streaming | [Streaming.md](Streaming.md) | HTTP progressive and HLS via NetworkKit, buffering events |
-| Metadata | [Metadata.md](Metadata.md) | Duration, resolution, codec, framerate natively for MOV plus ffprobe |
-| Thumbnails | [Thumbnails.md](Thumbnails.md) | Frame extraction for Finder previews |
-| Editing | [Editing.md](Editing.md) | Trim, concat and transcode via ffmpeg |
+| Metadata | [Metadata.md](Metadata.md) | Duration, resolution, codec, framerate from native parsers |
+| Thumbnails | [Thumbnails.md](Thumbnails.md) | Native frame extraction for Finder previews |
+| Editing | [Editing.md](Editing.md) | Native lossless trim and concat |
 | Mkv | [Mkv.md](Mkv.md) | Native `.mkv`/`.webm` parser, metadata and chapters fallback |
 | Avi | [Avi.md](Avi.md) | Native `.avi` parser, metadata and chapters fallback |
 | Mjpeg | [Mjpeg.md](Mjpeg.md) | Native baseline MJPEG decoder and fixture encoder |
@@ -46,6 +46,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: ffmpeg removed completely (native trim/concat, stills, frames, metadata).
 - 2026-09-27: ffmpeg-free playback + capture (`decode_video_frame`, `frame_at`, native V4L2).
 - 2026-09-27: Native pixel pipeline (`mjpeg`, `png_mini`, `extract_frame_native`, mov/avi samples).
 - 2026-09-27: Audio track support (PCM `sowt` writer, multi-track native trim).

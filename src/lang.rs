@@ -19,7 +19,6 @@ struct Messages {
     invalid_speed: String,
     subtitle_error: String,
     network_error: String,
-    ffmpeg_missing: String,
     #[serde(rename = "controls.play", default)]
     controls_play: String,
     #[serde(rename = "controls.pause", default)]
@@ -56,7 +55,6 @@ impl Messages {
             "invalid_speed" => Some(&self.invalid_speed),
             "subtitle_error" => Some(&self.subtitle_error),
             "network_error" => Some(&self.network_error),
-            "ffmpeg_missing" => Some(&self.ffmpeg_missing),
             "controls.play" => Some(&self.controls_play),
             "controls.pause" => Some(&self.controls_pause),
             "controls.stop" => Some(&self.controls_stop),

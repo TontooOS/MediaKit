@@ -1,4 +1,4 @@
-use mediakit::{extract_frame, read_metadata};
+use mediakit::{extract_frame_native, read_metadata};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,12 +15,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             meta.framerate,
             meta.container
         ),
-        Err(e) => println!("metadata unavailable (ffprobe missing?): {e}"),
+        Err(e) => println!("metadata unavailable (unsupported container?): {e}"),
     }
     let out = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "thumb.png".to_string());
-    match extract_frame(Path::new(&path), 5.0, Path::new(&out)) {
+    match extract_frame_native(Path::new(&path), 5.0, Path::new(&out)) {
         Ok(()) => println!("thumbnail written to {out}"),
         Err(e) => println!("thumbnail skipped: {e}"),
     }

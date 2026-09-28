@@ -1,10 +1,9 @@
 //! File playback: Play / Pause / Stop / Seek + speed + fullscreen flag.
 //!
 //! Core-only design: `VideoPlayer` owns transport state (position, speed,
-//! subtitles, chapters) and optionally spawns `mpv` (preferred) or
-//! `ffplay` for actual output. All state transitions are pure Rust and
-//! headless-testable; missing player binaries surface as
-//! `MediaError::NotAvailable` only when `spawn_external` is used.
+//! subtitles, chapters) and decodes frames natively via `frame_at` for
+//! WGPU upload. All state transitions are pure Rust and
+//! headless-testable. No external player binaries.
 
 use crate::chapters::ChapterList;
 use crate::error::{MediaError, Result};
@@ -12,7 +11,6 @@ use crate::format::probe_container;
 use crate::subtitles::SubtitleTrack;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 
 pub const MIN_SPEED: f32 = 0.5;
 pub const MAX_SPEED: f32 = 2.0;
@@ -45,7 +43,6 @@ pub struct VideoPlayer {
     display: DisplayMode,
     subtitles: Option<SubtitleTrack>,
     chapters: ChapterList,
-    child: Option<u32>,
 }
 
 impl Default for VideoPlayer {
@@ -61,7 +58,6 @@ impl Default for VideoPlayer {
             display: DisplayMode::Windowed,
             subtitles: None,
             chapters: ChapterList::default(),
-            child: None,
         }
     }
 }
@@ -86,7 +82,6 @@ impl VideoPlayer {
         self.duration_secs = crate::metadata::read_metadata(path)
             .map(|m| m.duration_secs)
             .unwrap_or(0.0);
-        self.child = None;
         Ok(())
     }
 
@@ -109,7 +104,6 @@ impl VideoPlayer {
     pub fn stop(&mut self) -> Result<()> {
         self.state = PlaybackState::Stopped;
         self.position_secs = 0.0;
-        self.kill_external();
         Ok(())
     }
 
@@ -191,27 +185,6 @@ impl VideoPlayer {
         crate::thumbnails::decode_video_frame(path, position_secs)
     }
 
-    /// Spawns `mpv` (or `ffplay` fallback) for real output.
-    /// Legacy path: prefer `frame_at` + WGPU upload, which needs no
-    /// external binary. Headless tests never call this.
-    pub fn spawn_external(&mut self) -> Result<()> {
-        let path = self.path.clone().ok_or(MediaError::NotAvailable)?;
-        let attempt = try_spawn(&path, self.speed, self.display);
-        match attempt {
-            Ok(child) => {
-                self.child = Some(child.id());
-                std::mem::forget(child);
-                self.state = PlaybackState::Playing;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn kill_external(&mut self) {
-        self.child = None;
-    }
-
     pub fn state(&self) -> PlaybackState {
         self.state
     }
@@ -239,28 +212,6 @@ impl VideoPlayer {
     pub fn chapters(&self) -> &ChapterList {
         &self.chapters
     }
-}
-
-fn try_spawn(path: &Path, speed: f32, display: DisplayMode) -> Result<Child> {
-    let arg = path.to_string_lossy().to_string();
-    let fs = matches!(display, DisplayMode::Fullscreen);
-    if let Ok(child) = Command::new("mpv")
-        .args([
-            arg.clone(),
-            format!("--speed={}", speed),
-            if fs { "--fs".to_string() } else { "--no-fs".to_string() },
-        ])
-        .spawn()
-    {
-        return Ok(child);
-    }
-    if let Ok(child) = Command::new("ffplay")
-        .args(["-autoexit", "-noborder", &arg])
-        .spawn()
-    {
-        return Ok(child);
-    }
-    Err(MediaError::NotAvailable)
 }
 
 #[cfg(test)]

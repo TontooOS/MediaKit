@@ -4,9 +4,8 @@ File playback (MP4, WebM, MKV, AVI) with Play, Pause, Stop, Seek, speed
 control, fullscreen switching, subtitles and chapters. Volume and mute
 are delegated to AudioKit instead of being reimplemented.
 
-Two output paths exist: the native frame provider (`frame_at`,
-no binaries) and the legacy external player (`spawn_external`
-with `mpv`/`ffplay`).
+Frames decode natively (`frame_at`); apps upload them to a WGPU
+texture. No external player binaries.
 
 ## Native frames
 
@@ -32,8 +31,8 @@ pub fn frame_at(&self, position_secs: f64) -> Result<NativeFrame>
 
 ## VideoPlayer
 
-Core transport state. Real output spawns `mpv` (preferred) or `ffplay`
-via `spawn_external`; all other transitions are pure Rust.
+Core transport state. Frames decode natively via `frame_at`;
+all transitions are pure Rust.
 
 ```rust
 let mut player = mediakit::VideoPlayer::new();
@@ -51,7 +50,7 @@ pub fn open(&mut self, path: &Path) -> Result<()>
 
 - Validates the container extension (MP4, WebM, MKV, AVI, MOV, M4V).
 - Returns `Err` when the file is missing or the format is unsupported.
-- Resets position and loads duration via ffprobe when available.
+- Resets position and loads duration via the native metadata parser.
 
 ### `VideoPlayer::play`
 
@@ -116,7 +115,7 @@ let mode = player.toggle_fullscreen();
 ```
 
 - Toggles between `DisplayMode::Windowed` and `DisplayMode::Fullscreen`.
-- Passed to `mpv` as `--fs` / `--no-fs` in `spawn_external`.
+- Read by apps to size their WGPU surface.
 
 ## Usage / Example
 

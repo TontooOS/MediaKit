@@ -3,7 +3,7 @@ name = "mediakit"
 version = "26.1.0"
 edition = "2021"
 license = "TCL"
-description = "Video framework for TontooOS - playback, camera capture, streaming, metadata, thumbnails and editing via ffmpeg"
+description = "Video framework for TontooOS - native parsing, decode, capture, streaming, metadata, thumbnails and lossless editing, no external binaries"
 authors = ["arlomu"]
 
 [lib]

@@ -17,7 +17,6 @@ pub enum MediaError {
     InvalidSpeed(f32),
     SubtitleError(String),
     NetworkError(String),
-    FfmpegMissing,
 }
 
 impl MediaError {
@@ -25,7 +24,6 @@ impl MediaError {
         match err.kind() {
             io::ErrorKind::PermissionDenied => MediaError::PermissionDenied,
             io::ErrorKind::TimedOut => MediaError::Timeout,
-            io::ErrorKind::NotFound => MediaError::FfmpegMissing,
             _ => MediaError::IoError(err.to_string()),
         }
     }
@@ -55,7 +53,6 @@ impl fmt::Display for MediaError {
             }
             MediaError::SubtitleError(e) => write!(f, "{}", lang::t_fmt("subtitle_error", e)),
             MediaError::NetworkError(e) => write!(f, "{}", lang::t_fmt("network_error", e)),
-            MediaError::FfmpegMissing => write!(f, "{}", lang::t("ffmpeg_missing")),
         }
     }
 }
@@ -87,8 +84,8 @@ mod tests {
     }
 
     #[test]
-    fn maps_not_found_to_ffmpeg_missing() {
+    fn maps_not_found_to_io_error() {
         let err = MediaError::from_io(io::Error::new(io::ErrorKind::NotFound, "nope"));
-        assert!(matches!(err, MediaError::FfmpegMissing));
+        assert!(matches!(err, MediaError::IoError(_)));
     }
 }

@@ -1,11 +1,10 @@
 //! Native ProRes support (SMPTE RDD 36 subset), pure Rust.
 //!
-//! Covers what MediaKit needs 1:1 for `.mov` today: fourcc detect,
+//! Covers what MediaKit needs for `.mov` today: fourcc detect,
 //! profile mapping, `icpf` frame-header validate and a GPU slice plan
-//! (tile ranges for a future WGPU compute decoder). Coefficient
-//! bitstream decode is intentionally out of scope for this step and
-//! stays on the ffmpeg path; the header API is stable so the GPU
-//! decoder can land without API churn.
+//! (tile ranges for a future WGPU compute decoder). CPU coefficient
+//! decode lives in `crate::prores_blocks` / `crate::prores_frame`;
+//! the header API stays stable for the GPU port.
 
 use crate::error::{MediaError, Result};
 use crate::mov::MovInfo;
@@ -243,28 +242,6 @@ pub fn gpu_slice_plan(width: u32, height: u32, slices: u16) -> Vec<(u32, u32)> {
     out
 }
 
-/// ffmpeg args for ProRes transcode targets (external path until the
-/// native GPU encoder lands). Profile selects `prores_ks` profile index.
-pub fn prores_ffmpeg_args(profile: ProResProfile) -> Vec<String> {
-    let index = match profile {
-        ProResProfile::Proxy => "0",
-        ProResProfile::Lt => "1",
-        ProResProfile::Standard => "2",
-        ProResProfile::Hq => "3",
-        ProResProfile::FourFourFourFour => "4",
-        ProResProfile::FourFourFourFourXq => "5",
-        ProResProfile::Unknown => "2",
-    };
-    vec![
-        "-c:v".into(),
-        "prores_ks".into(),
-        "-profile:v".into(),
-        index.into(),
-        "-c:a".into(),
-        "pcm_s16le".into(),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,12 +286,5 @@ mod tests {
         for w in plan.windows(2) {
             assert_eq!(w[0].1, w[1].0);
         }
-    }
-
-    #[test]
-    fn prores_args_select_encoder() {
-        let args = prores_ffmpeg_args(ProResProfile::Hq);
-        assert!(args.contains(&"prores_ks".to_string()));
-        assert!(args.contains(&"3".to_string()));
     }
 }

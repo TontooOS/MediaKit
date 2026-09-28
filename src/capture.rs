@@ -1,9 +1,10 @@
-//! Camera capture: device access, live preview info, record start/stop,
-//! quality selection and still snapshots via ffmpeg + V4L2.
+//! Camera capture: device access, live preview info and still
+//! snapshots. No external binaries for capture itself.
 //!
-//! Listing reads `/sys/class/video4linux` first (no binary needed) with a
-//! `v4l2-ctl --list-devices` fallback. Recording and snapshots shell to
-//! `ffmpeg -f v4l2 -i /dev/videoN`.
+//! Listing reads `/sys/class/video4linux` first with a `v4l2-ctl
+//! --list-devices` fallback. Stills capture natively on Linux
+//! (`capture_v4l2`); continuous recording needs an encoder and is
+//! intentionally absent until the native encoder milestone.
 
 use crate::error::{MediaError, Result};
 use serde::{Deserialize, Serialize};
@@ -52,24 +53,6 @@ impl CaptureQuality {
             CaptureQuality::Medium => "medium",
             CaptureQuality::High => "high",
             CaptureQuality::FullHd => "fullhd",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CaptureFormat {
-    #[default]
-    Mp4,
-    WebM,
-    Mkv,
-}
-
-impl CaptureFormat {
-    pub fn extension(&self) -> &'static str {
-        match self {
-            CaptureFormat::Mp4 => "mp4",
-            CaptureFormat::WebM => "webm",
-            CaptureFormat::Mkv => "mkv",
         }
     }
 }
@@ -162,56 +145,32 @@ fn classify_label(label: &str) -> CameraKind {
     }
 }
 
-/// Starts `ffmpeg` capture from `device` into `output`.
-/// Returns the child PID so apps can stop it via `stop_capture`.
-pub fn start_capture(
-    device: &CameraDevice,
-    output: &Path,
-    quality: CaptureQuality,
-    format: CaptureFormat,
-) -> Result<u32> {
-    let (w, h) = quality.size();
-    let child = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "v4l2",
-            "-video_size",
-            &format!("{w}x{h}"),
-            "-i",
-            &device.node.to_string_lossy(),
-            &output.to_string_lossy(),
-        ])
-        .spawn()
-        .map_err(MediaError::from_io)?;
-    let _ = format;
-    Ok(child.id())
-}
-
-/// Takes a single still snapshot from `device` into `output` (PNG/JPG).
+/// Takes a single still snapshot from `device` into `output` (PNG).
+/// Native path on Linux via `capture_v4l2`; other platforms return
+/// `NotAvailable` until their native backends land.
 pub fn snapshot(device: &CameraDevice, output: &Path) -> Result<()> {
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "v4l2",
-            "-video_size",
-            "1280x720",
-            "-i",
-            &device.node.to_string_lossy(),
-            "-vframes",
-            "1",
-            &output.to_string_lossy(),
-        ])
-        .status()
-        .map_err(MediaError::from_io)?;
-    if status.success() {
+    let ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "png" {
+        return Err(MediaError::UnsupportedFormat(format!(
+            "native snapshots write .png, got .{ext}"
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let frame = crate::capture_v4l2::capture_still_native(&device.node)?;
+        let png = crate::png_mini::encode_png_rgb(frame.width, frame.height, &frame.rgb)
+            .map_err(MediaError::ParseError)?;
+        std::fs::write(output, png).map_err(MediaError::from_io)?;
         Ok(())
-    } else {
-        Err(MediaError::CommandFailed(format!(
-            "ffmpeg snapshot failed for {}",
-            device.id
-        )))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        Err(MediaError::NotAvailable)
     }
 }
 
@@ -231,7 +190,18 @@ mod tests {
     fn quality_sizes() {
         assert_eq!(CaptureQuality::Low.size(), (640, 480));
         assert_eq!(CaptureQuality::Medium.size(), (1280, 720));
-        assert_eq!(CaptureFormat::Mp4.extension(), "mp4");
+    }
+
+    #[test]
+    fn snapshot_rejects_non_png() {
+        let device = CameraDevice {
+            id: "video9".to_string(),
+            label: "test".to_string(),
+            node: PathBuf::from("/dev/video9"),
+            kind: CameraKind::Unknown,
+        };
+        let err = snapshot(&device, Path::new("still.jpg")).unwrap_err();
+        assert!(matches!(err, MediaError::UnsupportedFormat(_)));
     }
 
     #[test]

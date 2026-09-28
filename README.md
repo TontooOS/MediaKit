@@ -1,6 +1,6 @@
 # MediaKit
 
-Video framework for TontooOS: file playback (MP4, WebM, MKV, AVI), camera capture, network streaming (HTTP progressive + HLS), metadata, thumbnails and basic editing via ffmpeg.
+Video framework for TontooOS: native file parsing (MOV, MKV/WebM, AVI), native decode (raw, TDC-1 ProRes subset, MJPEG), camera capture, network streaming (HTTP progressive + HLS), metadata, thumbnails and lossless MOV editing. No external binaries.
 
 ## Made for TontooOS
 

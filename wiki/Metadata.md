@@ -1,7 +1,7 @@
 # Metadata
 
 Video metadata (duration, resolution, codec, framerate), natively for
-`.mov`/`.mp4`/`.m4v` plus ffprobe fallback.
+`.mov`/`.mp4`/`.m4v`, `.mkv`/`.webm` and `.avi`.
 
 ## `read_metadata`
 
@@ -9,11 +9,9 @@ Video metadata (duration, resolution, codec, framerate), natively for
 pub fn read_metadata(path: &Path) -> Result<VideoMetadata>
 ```
 
-- Tries `read_mov_metadata` first for MOV extensions (no binary needed).
-- Runs `ffprobe -v quiet -print_format json -show_format -show_streams` otherwise.
-- Returns `Err(MediaError::FfmpegMissing)` when ffprobe is not on PATH
-  (surfaced as `IoError` NotFound mapping).
-- Returns `Err(MediaError::ParseError)` on unparsable JSON.
+- Dispatches on the extension to the native container parser.
+- Returns `Err(MediaError::UnsupportedFormat)` for unknown
+  extensions and `Err(MediaError::ParseError)` on damaged files.
 
 ### `VideoMetadata`
 
@@ -25,7 +23,7 @@ pub fn read_metadata(path: &Path) -> Result<VideoMetadata>
 | `video_codec` | `String` | Codec name, e.g. `"h264"` |
 | `audio_codec` | `Option<String>` | Audio codec, e.g. `"aac"` |
 | `framerate` | `f64` | Parsed `avg_frame_rate` (`30000/1001` to 29.97) |
-| `container` | `String` | ffprobe `format_name` |
+| `container` | `String` | Container name, e.g. `"qt"`, `"matroska"`, `"avi"` |
 | `size_bytes` | `Option<u64>` | File size when reported |
 
 ## Usage / Example

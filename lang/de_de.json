@@ -12,7 +12,6 @@
   "invalid_speed": "Ungültige Wiedergabegeschwindigkeit: {}",
   "subtitle_error": "Untertitelfehler: {}",
   "network_error": "Netzwerkstream-Fehler: {}",
-  "ffmpeg_missing": "ffmpeg/ffprobe nicht im PATH gefunden",
   "controls.play": "Abspielen",
   "controls.pause": "Pause",
   "controls.stop": "Stopp",

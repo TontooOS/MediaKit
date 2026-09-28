@@ -46,8 +46,8 @@ pub fn read_avi_metadata(path: &Path) -> Result<VideoMetadata>
 ```
 
 - Native-first path used by `read_metadata` for `.avi`.
-- Falls back to ffprobe for damaged files (see
-  [Metadata.md](Metadata.md)).
+- Unknown extensions and damaged files surface `ParseError`
+  (see [Metadata.md](Metadata.md)).
 
 ## Usage / Example
 

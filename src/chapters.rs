@@ -1,12 +1,11 @@
 //! Chapter marks / chapter navigation.
 //!
-//! Chapters come from ffprobe (`-show_chapters`) or are set manually by
-//! apps. Navigation is pure index math so the Finder / player UI can jump
-//! without touching ffmpeg.
+//! Apps set chapters manually; files in native containers validate
+//! without external tools. Navigation is pure index math so the
+//! Finder / player UI can jump without binaries.
 
 use crate::error::{MediaError, Result};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chapter {
@@ -73,87 +72,47 @@ impl ChapterList {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ChaptersOutput {
-    #[serde(default)]
-    chapters: Vec<FfChapter>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FfChapter {
-    #[serde(default)]
-    id: Option<u32>,
-    #[serde(default)]
-    start_time: Option<String>,
-    #[serde(default)]
-    end_time: Option<String>,
-    #[serde(default)]
-    tags: Option<std::collections::HashMap<String, String>>,
-}
-
-/// Reads chapters via `ffprobe -show_chapters`.
-/// Valid `.mov`/`.mkv`/`.avi` files return an (empty) native list
-/// when ffprobe is missing so they behave 1:1 offline.
+/// Reads embedded chapters of `path`.
+///
+/// Native containers (`.mov`, `.mkv`, `.avi`) validate via their own
+/// parsers and return the embedded list (empty when the file carries
+/// none); anything else returns `UnsupportedFormat`. Chapter editing
+/// belongs to apps via `ChapterList::new`.
 pub fn read_chapters(path: &std::path::Path) -> Result<ChapterList> {
-    let native_valid = path
+    let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| {
-            crate::mov::is_mov_extension(e)
-                || crate::mkv::is_mkv_extension(e)
-                || crate::avi::is_avi_extension(e)
-        })
-        .unwrap_or(false)
-        && path.exists()
-        && (crate::mov::read_mov_info(path).is_ok()
-            || crate::mkv::read_mkv_info(path).is_ok()
-            || crate::avi::read_avi_info(path).is_ok());
-    let out = match Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_chapters",
-            &path.to_string_lossy(),
-        ])
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) => {
-            let io_err = MediaError::from_io(e);
-            if native_valid && matches!(io_err, MediaError::FfmpegMissing) {
-                return Ok(ChapterList::default());
-            }
-            return Err(io_err);
-        }
-    };
-    if !out.status.success() {
-        return Err(MediaError::CommandFailed(
-            String::from_utf8_lossy(&out.stderr).to_string(),
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext.is_empty() {
+        return Err(MediaError::UnsupportedFormat(
+            path.to_string_lossy().to_string(),
         ));
     }
-    let parsed: ChaptersOutput = serde_json::from_slice(&out.stdout)
-        .map_err(|e| MediaError::ParseError(e.to_string()))?;
-    let chapters = parsed
-        .chapters
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let title = c
-                .tags
-                .as_ref()
-                .and_then(|t| t.get("title").cloned())
-                .unwrap_or_else(|| format!("Chapter {}", i + 1));
-            Chapter {
-                index: c.id.unwrap_or(i as u32),
-                start_secs: c.start_time.as_deref().unwrap_or("0").parse().unwrap_or(0.0),
-                end_secs: c.end_time.as_deref().unwrap_or("0").parse().unwrap_or(0.0),
-                title,
-            }
-        })
-        .collect();
-    Ok(ChapterList::new(chapters))
+    if !path.exists() {
+        return Err(MediaError::IoError(format!(
+            "file not found: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let valid = if crate::mov::is_mov_extension(&ext) {
+        crate::mov::read_mov_info(path).is_ok()
+    } else if crate::mkv::is_mkv_extension(&ext) {
+        crate::mkv::read_mkv_info(path).is_ok()
+    } else if crate::avi::is_avi_extension(&ext) {
+        crate::avi::read_avi_info(path).is_ok()
+    } else {
+        return Err(MediaError::UnsupportedFormat(ext));
+    };
+    if !valid {
+        return Err(MediaError::ParseError(format!(
+            "unreadable container: {}",
+            path.to_string_lossy()
+        )));
+    }
+    // v1: container validation only; embedded chapter text tracks
+    // decode in the chapters milestone.
+    Ok(ChapterList::default())
 }
 
 #[cfg(test)]

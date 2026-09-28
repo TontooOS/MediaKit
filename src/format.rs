@@ -10,7 +10,9 @@ use std::path::Path;
 /// Extensions MediaKit opens directly.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "avi", "mov", "m4v"];
 
-/// Best-effort extensions (demuxed when ffmpeg supports them).
+/// Best-effort extensions: accepted by the container probe, decoded
+/// natively where a decoder exists (otherwise `UnsupportedFormat`
+/// from the decode path).
 pub const EXTRA_EXTENSIONS: &[&str] = &["ogv", "ts", "m2ts", "flv"];
 
 /// Extensions with a native MOV parser (see `crate::mov`).
@@ -105,8 +107,8 @@ pub fn probe_container_native(path: &Path) -> Result<bool> {
     if crate::mov::sniff_mov(path) {
         return Ok(true);
     }
-    // Present but no ftyp: still extension-accepted for 1:1 compat,
-    // native metadata will fall back to ffprobe.
+    // Present but no ftyp: still extension-accepted; the native
+    // metadata parser decides (strict `ParseError` on garbage).
     Ok(false)
 }
 

@@ -4,11 +4,10 @@
 //! boxes are walked with `seek`, only `moov` is buffered fully so large
 //! `mdat` payloads are never loaded into memory.
 //!
-//! Coverage is the metadata subset MediaKit needs 1:1 for `.mov`:
+//! Coverage is the metadata subset MediaKit needs for `.mov`:
 //! duration, resolution, video/audio fourcc and framerate estimate.
-//! Full sample decode (ProRes coefficients) lives in `crate::prores`
-//! with the GPU slice plan; pixel output still uses the external
-//! ffmpeg path until the WGPU decoder lands.
+//! Sample decode runs through the native codecs (`raw`, TDC-1,
+//! MJPEG); TDC-1 GPU compute stays on the roadmap.
 
 use crate::error::{MediaError, Result};
 use crate::metadata::VideoMetadata;
@@ -482,8 +481,7 @@ fn looks_like_large_size(f: &mut File, _pos: u64) -> Result<bool> {
     Ok(false)
 }
 
-/// Converts native `MovInfo` into the shared `VideoMetadata` shape
-/// so `.mov` behaves 1:1 with the ffprobe path.
+/// Converts native `MovInfo` into the shared `VideoMetadata` shape.
 pub fn mov_to_metadata(info: &MovInfo, path: &Path) -> VideoMetadata {
     let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
     VideoMetadata {
@@ -617,6 +615,8 @@ struct SttsRun {
 #[derive(Debug, Clone, Default)]
 struct ParsedTrak {
     handler: String,
+    width: u32,
+    height: u32,
     tkhd: Span,
     tkhd_version: u8,
     mdhd: Span,
@@ -901,10 +901,22 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
     };
     let stsd_span = get(b"stsd")?;
     let (ts, te) = stsd_span.content_range();
-    // Video fourcc = first sample entry.
+    // Video fourcc + dimensions from the first sample entry.
     let mut video_fourcc = String::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
     if te - ts >= 16 {
         video_fourcc = fourcc(&moov[ts + 12..ts + 16]);
+    }
+    if handler == "vide" && te - ts >= 44 {
+        // Entry: size(4) fourcc(4) reserved(6) dataref(2) + 16
+        // predefined => width/height u16 at +32/+34.
+        let w = u16::from_be_bytes([moov[ts + 8 + 32], moov[ts + 8 + 33]]) as u32;
+        let h = u16::from_be_bytes([moov[ts + 8 + 34], moov[ts + 8 + 35]]) as u32;
+        if w > 0 && h > 0 {
+            width = w;
+            height = h;
+        }
     }
     let body_of = |name: &[u8; 4]| -> Result<Vec<u8>> {
         let s = stbl_kids
@@ -964,6 +976,8 @@ fn parse_trak_tables(moov: &[u8], trak_span: Span) -> Result<ParsedTrak> {
     }
     Ok(ParsedTrak {
         handler,
+        width,
+        height,
         tkhd,
         tkhd_version: tkhd_body[0],
         mdhd,
@@ -1073,6 +1087,58 @@ fn checked_u32(value: u64, what: &str) -> Result<u32> {
 /// `[start_secs, end_secs)`, rewrites sample tables and durations, and
 /// returns the new file bytes (ftyp + moov + single mdat, faststart
 /// order). No ffmpeg involved.
+/// Builds the single-entry `stco`/`co64` box for a new chunk offset.
+fn chunk_offset_box(wide: bool, chunk_offset: u64) -> Result<Vec<u8>> {
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    if wide {
+        payload.extend_from_slice(&chunk_offset.to_be_bytes());
+        make_box(b"co64", &payload)
+    } else {
+        payload.extend_from_slice(
+            &checked_u32(chunk_offset, "mdat offset overflow")?.to_be_bytes(),
+        );
+        make_box(b"stco", &payload)
+    }
+}
+
+/// Rebuilds one trak box with a new `stbl`, resolving `mdia`/`minf`
+/// against `base` (a moov-payload copy with identical layout).
+fn rebuild_trak(base: &[u8], trak_rel: Span, new_stbl: Vec<u8>) -> Result<Vec<u8>> {
+    let (tcs, tce) = trak_rel.content_range();
+    let trak_bytes = base
+        .get(tcs..tce)
+        .ok_or_else(|| parse_error("trak out of range"))?;
+    let trak_kids = scan_children(trak_bytes)?;
+    let mdia_box =
+        find_child(&trak_kids, b"mdia").ok_or_else(|| parse_error("trak missing mdia"))?;
+    let mdia_abs = Span {
+        start: tcs + mdia_box.start,
+        end: tcs + mdia_box.end,
+        header: mdia_box.header,
+    };
+    let (mdcs, mdce) = mdia_abs.content_range();
+    let mdia_bytes = base
+        .get(mdcs..mdce)
+        .ok_or_else(|| parse_error("mdia out of range"))?;
+    let mdia_kids = scan_children(mdia_bytes)?;
+    let minf_box =
+        find_child(&mdia_kids, b"minf").ok_or_else(|| parse_error("mdia missing minf"))?;
+    let minf_abs = Span {
+        start: mdcs + minf_box.start,
+        end: mdcs + minf_box.end,
+        header: minf_box.header,
+    };
+    let (mfs, mfe) = minf_abs.content_range();
+    let minf_payload = splice(&base[mfs..mfe], &[(*b"stbl", new_stbl)])?;
+    let new_minf = make_box(b"minf", &minf_payload)?;
+    let (mds, mde) = mdia_abs.content_range();
+    let mdia_payload = splice(&base[mds..mde], &[(*b"minf", new_minf)])?;
+    let new_mdia = make_box(b"mdia", &mdia_payload)?;
+    let trak_payload = splice(&base[tcs..tce], &[(*b"mdia", new_mdia)])?;
+    make_box(b"trak", &trak_payload)
+}
+
 pub(crate) fn trim_mov_bytes(data: &[u8], start_secs: f64, end_secs: f64) -> Result<Vec<u8>> {
     if data.len() > MAX_MOV_FILE_SIZE {
         return Err(parse_error("file too large for native trim"));
@@ -1250,58 +1316,6 @@ pub(crate) fn trim_mov_bytes(data: &[u8], start_secs: f64, end_secs: f64) -> Res
         }
         new_ctts_box = Some(make_box(b"ctts", &payload)?);
     }
-/// Builds the single-entry `stco`/`co64` box for a new chunk offset.
-fn chunk_offset_box(wide: bool, chunk_offset: u64) -> Result<Vec<u8>> {
-    let mut payload = vec![0u8; 8];
-    payload[4..8].copy_from_slice(&1u32.to_be_bytes());
-    if wide {
-        payload.extend_from_slice(&chunk_offset.to_be_bytes());
-        make_box(b"co64", &payload)
-    } else {
-        payload.extend_from_slice(
-            &checked_u32(chunk_offset, "mdat offset overflow")?.to_be_bytes(),
-        );
-        make_box(b"stco", &payload)
-    }
-}
-
-/// Rebuilds one trak box with a new `stbl`, resolving `mdia`/`minf`
-/// against `base` (a moov-payload copy with identical layout).
-fn rebuild_trak(base: &[u8], trak_rel: Span, new_stbl: Vec<u8>) -> Result<Vec<u8>> {
-    let (tcs, tce) = trak_rel.content_range();
-    let trak_bytes = base
-        .get(tcs..tce)
-        .ok_or_else(|| parse_error("trak out of range"))?;
-    let trak_kids = scan_children(trak_bytes)?;
-    let mdia_box =
-        find_child(&trak_kids, b"mdia").ok_or_else(|| parse_error("trak missing mdia"))?;
-    let mdia_abs = Span {
-        start: tcs + mdia_box.start,
-        end: tcs + mdia_box.end,
-        header: mdia_box.header,
-    };
-    let (mdcs, mdce) = mdia_abs.content_range();
-    let mdia_bytes = base
-        .get(mdcs..mdce)
-        .ok_or_else(|| parse_error("mdia out of range"))?;
-    let mdia_kids = scan_children(mdia_bytes)?;
-    let minf_box =
-        find_child(&mdia_kids, b"minf").ok_or_else(|| parse_error("mdia missing minf"))?;
-    let minf_abs = Span {
-        start: mdcs + minf_box.start,
-        end: mdcs + minf_box.end,
-        header: minf_box.header,
-    };
-    let (mfs, mfe) = minf_abs.content_range();
-    let minf_payload = splice(&base[mfs..mfe], &[(*b"stbl", new_stbl)])?;
-    let new_minf = make_box(b"minf", &minf_payload)?;
-    let (mds, mde) = mdia_abs.content_range();
-    let mdia_payload = splice(&base[mds..mde], &[(*b"minf", new_minf)])?;
-    let new_mdia = make_box(b"mdia", &mdia_payload)?;
-    let trak_payload = splice(&base[tcs..tce], &[(*b"mdia", new_mdia)])?;
-    make_box(b"trak", &trak_payload)
-}
-
 /// Lossless native trim of a multi-track `.mov`: each video/audio
 /// track is cut independently in its own timescale, samples land in
 /// one chunk per track. No ffmpeg involved.
@@ -1792,6 +1806,349 @@ pub fn read_mov_samples(path: &Path) -> Result<Vec<MovSample>> {
     Ok(out)
 }
 
+/// Losslessly concatenates single-chunk `.mov` files (same track
+/// layout, codecs, dimensions and timescales) into one faststart
+/// file. Samples append per track in input order. No ffmpeg.
+pub(crate) fn concat_mov_bytes(files: &[&[u8]]) -> Result<Vec<u8>> {
+    if files.is_empty() {
+        return Err(MediaError::ParseError("no inputs to concat".into()));
+    }
+    if files.len() > 1024 {
+        return Err(parse_error("too many inputs"));
+    }
+    struct Parsed<'a> {
+        data: &'a [u8],
+        ftyp: Span,
+        moov: Vec<u8>,
+        mvhd_span: Span,
+        mvhd_version: u8,
+        movie_timescale: u32,
+        traks: Vec<(Span, ParsedTrak)>,
+        mdat: &'a [u8],
+        mdat_base: u64,
+    }
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(files.len());
+    for data in files {
+        if data.len() > MAX_MOV_FILE_SIZE {
+            return Err(parse_error("file too large for native concat"));
+        }
+        let top = scan_children(data)?;
+        let ftyp = top
+            .iter()
+            .find(|(t, _)| t == b"ftyp")
+            .map(|(_, s)| *s)
+            .ok_or_else(|| parse_error("missing ftyp"))?;
+        let moov_span = top
+            .iter()
+            .find(|(t, _)| t == b"moov")
+            .map(|(_, s)| *s)
+            .ok_or_else(|| parse_error("missing moov"))?;
+        let mdats: Vec<Span> = top
+            .iter()
+            .filter(|(t, _)| t == b"mdat")
+            .map(|(_, s)| *s)
+            .collect();
+        if mdats.len() != 1 {
+            return Err(parse_error("native concat needs exactly one mdat"));
+        }
+        let (ms, me) = moov_span.content_range();
+        let moov = &data[ms..me];
+        let moov_kids = scan_children(moov)?;
+        let mvhd_span =
+            find_child(&moov_kids, b"mvhd").ok_or_else(|| parse_error("moov missing mvhd"))?;
+        let (vs, ve) = mvhd_span.content_range();
+        let mvhd_body = &moov[vs..ve];
+        if mvhd_body.len() < 20 {
+            return Err(parse_error("truncated mvhd"));
+        }
+        let mvhd_version = mvhd_body[0];
+        let movie_timescale = if mvhd_version == 1 {
+            be32(mvhd_body, 20)?
+        } else {
+            be32(mvhd_body, 12)?
+        };
+        if movie_timescale == 0 {
+            return Err(parse_error("null movie timescale"));
+        }
+        let mut traks = Vec::new();
+        for (typ, span) in &moov_kids {
+            if typ != b"trak" {
+                continue;
+            }
+            let trak = parse_trak_tables(moov, *span)?;
+            if trak.handler != "vide" && trak.handler != "soun" {
+                return Err(parse_error("native concat supports video+audio only"));
+            }
+            traks.push((*span, trak));
+        }
+        if traks.is_empty() {
+            return Err(parse_error("missing trak"));
+        }
+        let (ds, de) = mdats[0].content_range();
+        parsed.push(Parsed {
+            data,
+            ftyp,
+            moov: moov.to_vec(),
+            mvhd_span,
+            mvhd_version,
+            movie_timescale,
+            traks,
+            mdat: &data[ds..de],
+            mdat_base: ds as u64,
+        });
+    }
+    // Compatibility: same track count, handlers, timescales, codecs,
+    // dimensions.
+    let first = &parsed[0];
+    for p in &parsed[1..] {
+        if p.traks.len() != first.traks.len() {
+            return Err(parse_error("concat track count mismatch"));
+        }
+        if p.movie_timescale != first.movie_timescale {
+            return Err(parse_error("concat movie timescale mismatch"));
+        }
+        for (a, b) in p.traks.iter().zip(first.traks.iter()) {
+            if a.1.handler != b.1.handler
+                || a.1.media_timescale != b.1.media_timescale
+                || a.1.video_fourcc != b.1.video_fourcc
+                || a.1.width != b.1.width
+                || a.1.height != b.1.height
+            {
+                return Err(parse_error("concat track mismatch"));
+            }
+        }
+    }
+    // Combine samples per track index.
+    struct Combined {
+        trak_rel: Span,
+        trak: ParsedTrak,
+        data: Vec<u8>,
+        deltas: Vec<u32>,
+        sizes: Vec<u32>,
+        media_duration: u64,
+        sync: Vec<u32>,
+        ctts: Vec<(u8, Vec<(u32, i64)>)>,
+    }
+    let mut combined: Vec<Combined> = Vec::new();
+    for ti in 0..first.traks.len() {
+        let (rel, trak) = first.traks[ti].clone();
+        let mut deltas = Vec::new();
+        let mut sizes = Vec::new();
+        let mut data = Vec::new();
+        let mut sync = Vec::new();
+        let mut ctts: Vec<(u8, Vec<(u32, i64)>)> = Vec::new();
+        let mut base_count = 0u32;
+        for p in &parsed {
+            let (_, pt) = &p.traks[ti];
+            let samples = expand_samples(pt)?;
+            for i in 0..samples.deltas.len() {
+                deltas.push(samples.deltas[i]);
+                sizes.push(samples.sizes[i]);
+            }
+            for (i, &d) in samples.deltas.iter().enumerate() {
+                let _ = d;
+                let off = samples.offsets[i]
+                    .checked_sub(p.mdat_base)
+                    .ok_or_else(|| parse_error("sample outside mdat"))?
+                    as usize;
+                let size = samples.sizes[i] as usize;
+                if off + size > p.mdat.len() {
+                    return Err(parse_error("sample overruns mdat"));
+                }
+                data.extend_from_slice(&p.mdat[off..off + size]);
+            }
+            match &pt.stss {
+                Some(list) => {
+                    for &s in list {
+                        sync.push(s + base_count);
+                    }
+                }
+                None => {
+                    for k in 0..samples.deltas.len() as u32 {
+                        sync.push(base_count + k + 1);
+                    }
+                }
+            }
+            match pt.ctts_version {
+                Some(v) => {
+                    let expanded = expand_ctts(&pt.ctts, samples.deltas.len())?;
+                    ctts.push((v, expanded.into_iter().map(|x| (1u32, x)).collect()));
+                }
+                None => {}
+            }
+            base_count += samples.deltas.len() as u32;
+        }
+        let media_duration: u64 = deltas.iter().map(|&d| d as u64).sum();
+        combined.push(Combined {
+            trak_rel: rel,
+            trak,
+            data,
+            deltas,
+            sizes,
+            media_duration,
+            sync,
+            ctts,
+        });
+    }
+    // Durations: movie = longest track scaled.
+    let movie_timescale = first.movie_timescale;
+    let mut movie_duration = 0u64;
+    for c in &combined {
+        let scaled = (c.media_duration as u128 * movie_timescale as u128
+            + c.trak.media_timescale as u128 / 2)
+            / c.trak.media_timescale as u128;
+        movie_duration = movie_duration.max(scaled as u64);
+    }
+    // Template moov = first file; patch durations.
+    let mut patched = first.moov.clone();
+    {
+        let (s, e) = first.mvhd_span.content_range();
+        let body = &mut patched[s..e];
+        if first.mvhd_version == 1 {
+            patch_u64(body, 24, movie_duration)?;
+        } else {
+            patch_u32(body, 16, checked_u32(movie_duration, "movie duration overflow")?)?;
+        }
+    }
+    for c in &combined {
+        let (s, e) = c.trak.mdhd.content_range();
+        let body = &mut patched[s..e];
+        if c.trak.mdhd_version == 1 {
+            patch_u64(body, 24, c.media_duration)?;
+        } else {
+            patch_u32(
+                body,
+                16,
+                checked_u32(c.media_duration, "media duration overflow")?,
+            )?;
+        }
+        let (s, e) = c.trak.tkhd.content_range();
+        let body = &mut patched[s..e];
+        if c.trak.tkhd_version == 1 {
+            patch_u64(body, 28, movie_duration)?;
+        } else {
+            patch_u32(body, 20, checked_u32(movie_duration, "track duration overflow")?)?;
+        }
+    }
+    // NOTE: track spans below are moov-absolute in the template;
+    // `patched` shares its layout, so they stay valid.
+    let build_all = |offsets: &[u64]| -> Result<Vec<Vec<u8>>> {
+        let mut traks = Vec::with_capacity(combined.len());
+        for (c, &off) in combined.iter().zip(offsets) {
+            let n = c.deltas.len();
+            let mut stts_payload = vec![0u8; 8];
+            let runs = repack_runs_u32(&c.deltas);
+            stts_payload[4..8].copy_from_slice(&(runs.len() as u32).to_be_bytes());
+            for (count, delta) in &runs {
+                stts_payload.extend_from_slice(&count.to_be_bytes());
+                stts_payload.extend_from_slice(&delta.to_be_bytes());
+            }
+            let new_stts = make_box(b"stts", &stts_payload)?;
+            let mut stsc_payload = vec![0u8; 8];
+            stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+            stsc_payload.extend_from_slice(&(n as u32).to_be_bytes());
+            stsc_payload.extend_from_slice(&c.trak.stsc[0].2.to_be_bytes());
+            let new_stsc = make_box(b"stsc", &stsc_payload)?;
+            let uniform = c.sizes.iter().all(|&s| s == c.sizes[0]);
+            let mut stsz_payload = vec![0u8; 12];
+            if uniform {
+                stsz_payload[4..8].copy_from_slice(&c.sizes[0].to_be_bytes());
+                stsz_payload[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+            } else {
+                stsz_payload[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+                for &s in &c.sizes {
+                    stsz_payload.extend_from_slice(&s.to_be_bytes());
+                }
+            }
+            let new_stsz = make_box(b"stsz", &stsz_payload)?;
+            let mut repl: Vec<([u8; 4], Vec<u8>)> = vec![
+                (*b"stts", new_stts),
+                (*b"stsc", new_stsc),
+                (*b"stsz", new_stsz),
+                (
+                    if c.trak.chunk_offsets_64 { *b"co64" } else { *b"stco" },
+                    chunk_offset_box(c.trak.chunk_offsets_64, off)?,
+                ),
+            ];
+            if !c.sync.is_empty() {
+                // All-sync (from absent stss) round-trips as explicit.
+                let mut payload = vec![0u8; 8];
+                payload[4..8].copy_from_slice(&(c.sync.len() as u32).to_be_bytes());
+                for &s in &c.sync {
+                    payload.extend_from_slice(&s.to_be_bytes());
+                }
+                repl.push((*b"stss", make_box(b"stss", &payload)?));
+            }
+            if !c.ctts.is_empty() {
+                let versions: Vec<u8> = c.ctts.iter().map(|(v, _)| *v).collect();
+                if versions.iter().any(|&v| v != versions[0]) {
+                    return Err(parse_error("concat ctts version mismatch"));
+                }
+                let flat: Vec<i64> = c.ctts.iter().flat_map(|(_, r)| r.iter().map(|(_, o)| *o)).collect();
+                let runs = repack_runs_i64(&flat);
+                let mut payload = vec![versions[0], 0, 0, 0];
+                payload.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+                for (count, offset) in &runs {
+                    payload.extend_from_slice(&count.to_be_bytes());
+                    if versions[0] == 1 {
+                        payload.extend_from_slice(&(*offset as i32).to_be_bytes());
+                    } else {
+                        payload.extend_from_slice(&(*offset as u32).to_be_bytes());
+                    }
+                }
+                repl.push((*b"ctts", make_box(b"ctts", &payload)?));
+            }
+            let (ss, se) = c.trak.stbl.content_range();
+            let payload = splice(&patched[ss..se], &repl)?;
+            traks.push(rebuild_trak(&patched, c.trak_rel, make_box(b"stbl", &payload)?)?);
+        }
+        Ok(traks)
+    };
+    let assemble = |new_traks: Vec<Vec<u8>>| -> Result<Vec<u8>> {
+        let kids = scan_children(&patched)?;
+        let mut out = Vec::new();
+        let mut ti = 0usize;
+        for (typ, span) in kids {
+            if &typ == b"trak" {
+                out.extend_from_slice(
+                    new_traks
+                        .get(ti)
+                        .ok_or_else(|| parse_error("trak count mismatch"))?,
+                );
+                ti += 1;
+            } else {
+                out.extend_from_slice(&patched[span.start..span.end]);
+            }
+        }
+        if ti != new_traks.len() {
+            return Err(parse_error("trak count mismatch"));
+        }
+        make_box(b"moov", &out)
+    };
+    let ftyp_len = first.ftyp.end - first.ftyp.start;
+    let zeros = vec![0u64; combined.len()];
+    let moov_zero = assemble(build_all(&zeros)?)?;
+    let mut offsets = Vec::with_capacity(combined.len());
+    let mut cursor = ftyp_len as u64 + moov_zero.len() as u64 + 8;
+    for c in &combined {
+        offsets.push(cursor);
+        cursor += c.data.len() as u64;
+    }
+    let moov_final = assemble(build_all(&offsets)?)?;
+    let mut mdat_payload = Vec::new();
+    for c in &combined {
+        mdat_payload.extend_from_slice(&c.data);
+    }
+    let new_mdat = make_box(b"mdat", &mdat_payload)?;
+    let mut out = Vec::with_capacity(ftyp_len + moov_final.len() + new_mdat.len());
+    let first_data = files[0];
+    out.extend_from_slice(&first_data[first.ftyp.start..first.ftyp.end]);
+    out.extend_from_slice(&moov_final);
+    out.extend_from_slice(&new_mdat);
+    Ok(out)
+}
+
 // ---------- Minimal raw RGB .mov writer (fixtures, capture targets) ----------
 
 /// Parameters for [`build_raw_mov`].
@@ -2232,5 +2589,34 @@ mod tests {
         let expect: Vec<u8> = (3200..3208u32).map(|i| (i % 256) as u8).collect();
         assert_eq!(first_audio, &expect[..]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_concat_appends_samples() {
+        let a = raw_fixture(4);
+        let b = raw_fixture(6);
+        let out = concat_mov_bytes(&[&a, &b]).unwrap();
+        assert!(is_mov_bytes(&out));
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mediakit-concat-{}.mov", std::process::id()));
+        std::fs::write(&path, &out).unwrap();
+        let info = read_mov_info(&path).unwrap();
+        // 10 frames @10fps.
+        assert!((info.duration_secs - 1.0).abs() < 0.001);
+        assert!((info.framerate - 10.0).abs() < 0.01);
+        // Last frame comes from file b (value 5).
+        let top = scan_children(&out).unwrap();
+        let mdat = top.iter().find(|(t, _)| t == b"mdat").unwrap().1;
+        let (s, _) = mdat.content_range();
+        assert_eq!(&out[s + 9 * 24..s + 10 * 24], &[5u8; 24][..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_concat_rejects_mismatch() {
+        let a = raw_fixture(4);
+        assert!(concat_mov_bytes(&[]).is_err());
+        assert!(concat_mov_bytes(&[&a]).is_ok());
+        assert!(concat_mov_bytes(&[&b"not a mov"[..]]).is_err());
     }
 }

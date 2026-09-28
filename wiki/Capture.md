@@ -1,8 +1,7 @@
 # Capture
 
-Camera access, live-preview device info, recording start/stop,
-format/quality selection, camera selection and still snapshots from the
-live stream via V4L2 and ffmpeg.
+Camera access, live-preview device info and still snapshots from the
+live stream via V4L2. No external binaries.
 
 ## Camera listing
 
@@ -27,25 +26,16 @@ for cam in &cameras {
 | `node` | `PathBuf` | Device node, e.g. `/dev/video0` |
 | `kind` | `CameraKind` | `BuiltIn`, `Usb`, `Virtual` or `Unknown` |
 
-## Recording
+## Snapshots
 
 ```rust
-let out = std::path::Path::new("take.mp4");
-let pid = mediakit::start_capture(
-    &cameras[0],
-    out,
-    mediakit::CaptureQuality::Medium,
-    mediakit::CaptureFormat::Mp4,
-)?;
+mediakit::snapshot(&cameras[0], std::path::Path::new("still.png"))?;
 ```
 
-- Shells to `ffmpeg -f v4l2 -video_size WxH -i /dev/videoN <output>`.
-- Returns the ffmpeg PID; apps stop it with SIGTERM/SIGINT.
-- `CaptureQuality` maps to 640x480 (Low), 1280x720 (Medium) and
-  1920x1080 (High, FullHd).
-- `CaptureFormat` selects the output extension (Mp4, WebM, Mkv).
-
-## Native stills (no ffmpeg, Linux only)
+- Captures natively on Linux and writes PNG (other extensions
+  return `UnsupportedFormat`).
+- Continuous recording is absent until the native encoder
+  milestone (no external recorder binaries).
 
 ```rust
 let frame = mediakit::capture_still_native(&cameras[0].node)?;
@@ -67,15 +57,6 @@ let frame = mediakit::capture_still_native(&cameras[0].node)?;
 | `width` | `u32` | Negotiated width in pixels |
 | `height` | `u32` | Negotiated height in pixels |
 | `rgb` | `Vec<u8>` | Packed RGB24 |
-
-## Snapshots
-
-```rust
-mediakit::snapshot(&cameras[0], std::path::Path::new("still.png"))?;
-```
-
-- Grabs one frame with `ffmpeg -vframes 1`.
-- Output format follows the file extension (PNG/JPG).
 
 ## Usage / Example
 
