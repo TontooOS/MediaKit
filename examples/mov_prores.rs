@@ -1,4 +1,4 @@
-use mediakit::{detect_profile_from_mov, read_mov_info, sniff_mov, VideoPlayer};
+use mediakit::{detect_profile_from_mov, read_mkv_info, read_mov_info, sniff_mkv, sniff_mov, VideoPlayer};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "sample.mov".to_string());
     let path = Path::new(&path);
-    println!("sniff_mov: {}", sniff_mov(path));
+    println!("sniff_mov: {} sniff_mkv: {}", sniff_mov(path), sniff_mkv(path));
     let mut player = VideoPlayer::new();
     match player.open(path) {
         Ok(()) => println!(
@@ -35,6 +35,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("metadata native: {} {}x{}", meta.container, meta.width, meta.height);
         }
         Err(e) => println!("mov info (expected without file): {e}"),
+    }
+    match read_mkv_info(path) {
+        Ok(info) => println!(
+            "mkv doctype={} {}x{} {:.2}s {} {}fps",
+            info.container_name(),
+            info.width,
+            info.height,
+            info.duration_secs,
+            info.video_codec,
+            info.framerate
+        ),
+        Err(e) => println!("mkv info (expected without file): {e}"),
     }
     Ok(())
 }

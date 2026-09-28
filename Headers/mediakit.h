@@ -21,6 +21,7 @@ int32_t tontoo_mediakit_state(uint64_t id);
 
 char *tontoo_mediakit_metadata(const char *path, char **error_out);
 char *tontoo_mediakit_mov_info(const char *path, char **error_out);
+char *tontoo_mediakit_mkv_info(const char *path, char **error_out);
 int32_t tontoo_mediakit_prores_profile(const char *fourcc);
 char *tontoo_mediakit_list_cameras(char **error_out);
 int32_t tontoo_mediakit_load_subtitles(uint64_t id, const char *subtitle_path, char **error_out);

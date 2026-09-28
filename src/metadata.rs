@@ -55,14 +55,21 @@ struct FfprobeStream {
     avg_frame_rate: Option<String>,
 }
 
-/// Reads metadata for `path`, native MOV first, ffprobe fallback.
+/// Reads metadata for `path`: native MOV/MKV first, ffprobe fallback.
 pub fn read_metadata(path: &Path) -> Result<VideoMetadata> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if crate::mov::is_mov_extension(ext) && path.exists() {
-            if let Ok(meta) = crate::mov::read_mov_metadata(path) {
-                return Ok(meta);
+        if path.exists() {
+            if crate::mov::is_mov_extension(ext) {
+                if let Ok(meta) = crate::mov::read_mov_metadata(path) {
+                    return Ok(meta);
+                }
+                // Fall through to ffprobe for damaged/partial files.
+            } else if crate::mkv::is_mkv_extension(ext) {
+                if let Ok(meta) = crate::mkv::read_mkv_metadata(path) {
+                    return Ok(meta);
+                }
+                // Fall through to ffprobe for damaged/partial files.
             }
-            // Fall through to ffprobe for damaged/partial MOV files.
         }
     }
     let out = Command::new("ffprobe")

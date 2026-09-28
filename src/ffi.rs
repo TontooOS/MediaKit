@@ -345,6 +345,34 @@ pub extern "C" fn tontoo_mediakit_mov_info(
     }
 }
 
+/// Native `.mkv` info as JSON (no ffprobe required), or NULL.
+#[no_mangle]
+pub extern "C" fn tontoo_mediakit_mkv_info(
+    path: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    let Some(path) = c_str(path) else {
+        set_error(error_out, "invalid path");
+        return std::ptr::null_mut();
+    };
+    match crate::read_mkv_info(Path::new(&path)) {
+        Ok(info) => json_ptr(&json!({
+            "doctype": info.doctype,
+            "duration_secs": info.duration_secs,
+            "width": info.width,
+            "height": info.height,
+            "video_codec": info.video_codec,
+            "audio_codec": info.audio_codec,
+            "framerate": info.framerate,
+            "container": info.container_name(),
+        })),
+        Err(e) => {
+            set_error(error_out, &e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// ProRes profile for a fourcc string: 1 proxy, 2 LT, 3 standard,
 /// 4 HQ, 5 4444, 6 4444XQ, 0 unknown.
 #[no_mangle]

@@ -21,6 +21,7 @@ dependency.
 | Metadata | [Metadata.md](Metadata.md) | Duration, resolution, codec, framerate natively for MOV plus ffprobe |
 | Thumbnails | [Thumbnails.md](Thumbnails.md) | Frame extraction for Finder previews |
 | Editing | [Editing.md](Editing.md) | Trim, concat and transcode via ffmpeg |
+| Mkv | [Mkv.md](Mkv.md) | Native `.mkv`/`.webm` parser, metadata and chapters fallback |
 | ProRes | [ProRes.md](ProRes.md) | Native `.mov` parser and ProRes profiles plus GPU slice plan |
 | Devices | [Devices.md](Devices.md) | Camera and video-output listing |
 | Controls | [Controls.md](Controls.md) | SF Symbols via CoreIcon, SF Pro via CoreText, theme colors |
@@ -43,6 +44,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: Native Matroska/WebM support (`mkv`, metadata, chapters, FFI).
 - 2026-09-27: Native ProRes decode TDC-1 subset (`prores_blocks`, `prores_frame`, 14 tests).
 - 2026-09-27: Native lossless `.mov` trim (`trim_mov_native`), raw `.mov` writer (`build_raw_mov`).
 - 2026-09-27: Native `.mov`/ProRes support (`mov`, `prores`, `transcode_prores`, FFI).

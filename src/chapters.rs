@@ -92,16 +92,17 @@ struct FfChapter {
 }
 
 /// Reads chapters via `ffprobe -show_chapters`.
-/// Valid `.mov` files return an (empty) native list when ffprobe is
-/// missing so `.mov` behaves 1:1 offline.
+/// Valid `.mov`/`.mkv` files return an (empty) native list when
+/// ffprobe is missing so they behave 1:1 offline.
 pub fn read_chapters(path: &std::path::Path) -> Result<ChapterList> {
-    let native_mov_valid = path
+    let native_valid = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| crate::mov::is_mov_extension(e))
+        .map(|e| crate::mov::is_mov_extension(e) || crate::mkv::is_mkv_extension(e))
         .unwrap_or(false)
         && path.exists()
-        && crate::mov::read_mov_info(path).is_ok();
+        && (crate::mov::read_mov_info(path).is_ok()
+            || crate::mkv::read_mkv_info(path).is_ok());
     let out = match Command::new("ffprobe")
         .args([
             "-v",
@@ -116,7 +117,7 @@ pub fn read_chapters(path: &std::path::Path) -> Result<ChapterList> {
         Ok(out) => out,
         Err(e) => {
             let io_err = MediaError::from_io(e);
-            if native_mov_valid && matches!(io_err, MediaError::FfmpegMissing) {
+            if native_valid && matches!(io_err, MediaError::FfmpegMissing) {
                 return Ok(ChapterList::default());
             }
             return Err(io_err);
