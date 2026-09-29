@@ -26,6 +26,7 @@ binaries, without any cloud dependency.
 | Mjpeg | [Mjpeg.md](Mjpeg.md) | Native baseline MJPEG decoder and fixture encoder |
 | ProRes | [ProRes.md](ProRes.md) | Native `.mov` parser and ProRes profiles plus GPU slice plan |
 | Devices | [Devices.md](Devices.md) | Camera and video-output listing |
+| HwAccel | [HwAccel.md](HwAccel.md) | System-GPU H.264 decode via VA-API, capability query and sessions |
 | Controls | [Controls.md](Controls.md) | SF Symbols via CoreIcon, SF Pro via CoreText, theme colors |
 | Ffi | [Ffi.md](Ffi.md) | C ABI (`tontoo_mediakit_*`) and JSON shapes |
 | Localization | [Localization.md](Localization.md) | Error message localization via `lang/en_us.json` and `lang/de_de.json` |
@@ -46,7 +47,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
-- 2026-09-27: serde/serde_json replaced by Foundation (lang, FFI JSON, derives dropped).
+- 2026-09-29: System-GPU H.264 decode via VA-API (`hwaccel`: capability query, I-slice sessions, Annex-B/SPS tooling).- 2026-09-27: serde/serde_json replaced by Foundation (lang, FFI JSON, derives dropped).
 - 2026-09-27: Native DRM outputs (`/dev/dri`, no swaymsg/xrandr), direct `/dev/video` scan.
 - 2026-09-27: ffmpeg removed completely (native trim/concat, stills, frames, metadata).
 - 2026-09-27: ffmpeg-free playback + capture (`decode_video_frame`, `frame_at`, native V4L2).

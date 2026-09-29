@@ -9,6 +9,8 @@ pub mod devices;
 pub mod edit;
 pub mod error;
 pub mod format;
+#[cfg(target_os = "linux")]
+pub mod hwaccel;
 pub mod lang;
 pub mod metadata;
 pub mod mjpeg;
@@ -37,6 +39,13 @@ pub use devices::{available_cameras, available_outputs, VideoOutput};
 pub use edit::{concat_mov_native, trim_mov_native};
 pub use error::{MediaError, Result};
 pub use format::{is_supported, probe_container, probe_container_native, VideoContainer, MOV_EXTENSIONS, SUPPORTED_EXTENSIONS};
+#[cfg(target_os = "linux")]
+pub use hwaccel::{
+    annexb_to_rgb, decode_annexb_to_yuv, ebsp_to_rbsp, h264_nal_type_name, h264_profile_name,
+    hw_decoder_info, hw_decoder_info_from_nodes, i420_to_rgb, normalize_slice_type, nv12_to_rgb,
+    parse_pps, parse_slice_header, parse_sps, parse_sps_dimensions, split_annexb_nals,
+    HwDecoder, HwFrame, NalUnit, PpsInfo, SliceInfo, SpsInfo, VaapiSession,
+};
 pub use metadata::{read_metadata, VideoMetadata};
 pub use mjpeg::{decode_jpeg, encode_jpeg_fixture, JpegError, JpegImage, JpegSampling};
 pub use mkv::{is_mkv_extension, read_mkv_info, read_mkv_metadata, sniff_mkv, MkvInfo};
