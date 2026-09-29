@@ -46,6 +46,7 @@ See [Playback.md](Playback.md) for details.
 
 ## Changelog
 
+- 2026-09-27: serde/serde_json replaced by Foundation (lang, FFI JSON, derives dropped).
 - 2026-09-27: Native DRM outputs (`/dev/dri`, no swaymsg/xrandr), direct `/dev/video` scan.
 - 2026-09-27: ffmpeg removed completely (native trim/concat, stills, frames, metadata).
 - 2026-09-27: ffmpeg-free playback + capture (`decode_video_frame`, `frame_at`, native V4L2).

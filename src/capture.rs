@@ -1,16 +1,15 @@
 //! Camera capture: device access, live preview info and still
 //! snapshots. No external binaries for capture itself.
 //!
-//! Listing reads `/sys/class/video4linux` first with a `v4l2-ctl
-//! --list-devices` fallback. Stills capture natively on Linux
+//! Listing reads `/sys/class/video4linux` first with a direct
+//! `/dev/video` scan as fallback. Stills capture natively on Linux
 //! (`capture_v4l2`); continuous recording needs an encoder and is
 //! intentionally absent until the native encoder milestone.
 
 use crate::error::{MediaError, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CameraDevice {
     pub id: String,
     pub label: String,
@@ -18,7 +17,7 @@ pub struct CameraDevice {
     pub kind: CameraKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CameraKind {
     #[default]
     Unknown,

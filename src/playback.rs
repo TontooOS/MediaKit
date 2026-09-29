@@ -9,13 +9,12 @@ use crate::chapters::ChapterList;
 use crate::error::{MediaError, Result};
 use crate::format::probe_container;
 use crate::subtitles::SubtitleTrack;
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const MIN_SPEED: f32 = 0.5;
 pub const MAX_SPEED: f32 = 2.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlaybackState {
     #[default]
     Stopped,

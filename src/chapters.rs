@@ -5,9 +5,8 @@
 //! Finder / player UI can jump without binaries.
 
 use crate::error::{MediaError, Result};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Chapter {
     pub index: u32,
     pub start_secs: f64,

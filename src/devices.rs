@@ -6,9 +6,8 @@
 
 use crate::capture::{list_cameras, CameraDevice};
 use crate::error::Result;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct VideoOutput {
     pub id: String,
     pub label: String,

@@ -2,10 +2,9 @@
 //! `.mkv`, `.avi`). No external binaries.
 
 use crate::error::{MediaError, Result};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct VideoMetadata {
     pub duration_secs: f64,
     pub width: u32,

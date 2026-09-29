@@ -5,7 +5,7 @@ use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use serde_json::{json, Value};
+use foundation::serialization::{JsonObject, JsonValue};
 
 use crate::{ChapterList, SubtitleTrack, VideoPlayer};
 
@@ -26,10 +26,39 @@ fn set_error(error_out: *mut *mut c_char, message: &str) {
     }
 }
 
-fn json_ptr(value: &Value) -> *mut c_char {
-    CString::new(value.to_string())
-        .unwrap_or_default()
-        .into_raw()
+fn json_ptr_str(json: String) -> *mut c_char {
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Builds a metadata-style info object. `None` on non-finite floats.
+#[allow(clippy::too_many_arguments)]
+fn build_info(
+    str_fields: &[(&str, &str)],
+    opt_fields: &[(&str, Option<&str>)],
+    f64_fields: &[(&str, f64)],
+    u64_fields: &[(&str, u64)],
+) -> Option<String> {
+    let mut obj = JsonObject::new();
+    for (k, v) in str_fields {
+        obj.field_str(k, v);
+    }
+    for (k, v) in opt_fields {
+        match v {
+            Some(s) => {
+                obj.field_str(k, s);
+            }
+            None => {
+                obj.field_null(k);
+            }
+        }
+    }
+    for (k, v) in f64_fields {
+        obj.field_f64(k, *v).ok()?;
+    }
+    for (k, v) in u64_fields {
+        obj.field_u64(k, *v);
+    }
+    obj.build(false).ok()
 }
 
 fn c_str(ptr: *const c_char) -> Option<String> {
@@ -214,15 +243,27 @@ pub extern "C" fn tontoo_mediakit_metadata(
         return std::ptr::null_mut();
     };
     match crate::read_metadata(Path::new(&path)) {
-        Ok(meta) => json_ptr(&json!({
-            "duration_secs": meta.duration_secs,
-            "width": meta.width,
-            "height": meta.height,
-            "video_codec": meta.video_codec,
-            "audio_codec": meta.audio_codec,
-            "framerate": meta.framerate,
-            "container": meta.container,
-        })),
+        Ok(meta) => match build_info(
+            &[
+                ("video_codec", meta.video_codec.as_str()),
+                ("container", meta.container.as_str()),
+            ],
+            &[("audio_codec", meta.audio_codec.as_deref())],
+            &[
+                ("duration_secs", meta.duration_secs),
+                ("framerate", meta.framerate),
+            ],
+            &[
+                ("width", meta.width as u64),
+                ("height", meta.height as u64),
+            ],
+        ) {
+            Some(s) => json_ptr_str(s),
+            None => {
+                set_error(error_out, "non-finite metadata value");
+                std::ptr::null_mut()
+            }
+        },
         Err(e) => {
             set_error(error_out, &e.to_string());
             std::ptr::null_mut()
@@ -235,17 +276,20 @@ pub extern "C" fn tontoo_mediakit_metadata(
 pub extern "C" fn tontoo_mediakit_list_cameras(error_out: *mut *mut c_char) -> *mut c_char {
     match crate::list_cameras() {
         Ok(cameras) => {
-            let arr: Vec<Value> = cameras
+            let items: Vec<JsonValue> = cameras
                 .iter()
                 .map(|c| {
-                    json!({
-                        "id": c.id,
-                        "label": c.label,
-                        "node": c.node.to_string_lossy(),
-                    })
+                    JsonValue::Object(vec![
+                        ("id".to_string(), JsonValue::Str(c.id.clone())),
+                        ("label".to_string(), JsonValue::Str(c.label.clone())),
+                        (
+                            "node".to_string(),
+                            JsonValue::Str(c.node.to_string_lossy().to_string()),
+                        ),
+                    ])
                 })
                 .collect();
-            json_ptr(&Value::Array(arr))
+            json_ptr_str(JsonValue::Array(items).stringify(false))
         }
         Err(e) => {
             set_error(error_out, &e.to_string());
@@ -293,19 +337,19 @@ pub extern "C" fn tontoo_mediakit_chapters(
     };
     let list: ChapterList =
         crate::read_chapters(Path::new(&path)).unwrap_or_default();
-    let arr: Vec<Value> = list
+    let items: Vec<JsonValue> = list
         .chapters
         .iter()
         .map(|c| {
-            json!({
-                "index": c.index,
-                "start_secs": c.start_secs,
-                "end_secs": c.end_secs,
-                "title": c.title,
-            })
+            JsonValue::Object(vec![
+                ("index".to_string(), JsonValue::Integer(c.index as i64)),
+                ("start_secs".to_string(), JsonValue::Float(c.start_secs)),
+                ("end_secs".to_string(), JsonValue::Float(c.end_secs)),
+                ("title".to_string(), JsonValue::Str(c.title.clone())),
+            ])
         })
         .collect();
-    json_ptr(&Value::Array(arr))
+    json_ptr_str(JsonValue::Array(items).stringify(false))
 }
 
 /// System volume in percent, or -1 when unavailable.
@@ -328,16 +372,31 @@ pub extern "C" fn tontoo_mediakit_mov_info(
         return std::ptr::null_mut();
     };
     match crate::read_mov_info(Path::new(&path)) {
-        Ok(info) => json_ptr(&json!({
-            "major_brand": info.major_brand,
-            "duration_secs": info.duration_secs,
-            "width": info.width,
-            "height": info.height,
-            "video_fourcc": info.video_fourcc,
-            "audio_fourcc": info.audio_fourcc,
-            "framerate": info.framerate,
-            "container": info.container_name(),
-        })),
+        Ok(info) => {
+            let container = info.container_name();
+            match build_info(
+                &[
+                    ("major_brand", info.major_brand.as_str()),
+                    ("video_fourcc", info.video_fourcc.as_str()),
+                    ("container", container.as_str()),
+                ],
+                &[("audio_fourcc", info.audio_fourcc.as_deref())],
+                &[
+                    ("duration_secs", info.duration_secs),
+                    ("framerate", info.framerate),
+                ],
+                &[
+                    ("width", info.width as u64),
+                    ("height", info.height as u64),
+                ],
+            ) {
+                Some(s) => json_ptr_str(s),
+                None => {
+                    set_error(error_out, "non-finite metadata value");
+                    std::ptr::null_mut()
+                }
+            }
+        }
         Err(e) => {
             set_error(error_out, &e.to_string());
             std::ptr::null_mut()
@@ -356,16 +415,31 @@ pub extern "C" fn tontoo_mediakit_mkv_info(
         return std::ptr::null_mut();
     };
     match crate::read_mkv_info(Path::new(&path)) {
-        Ok(info) => json_ptr(&json!({
-            "doctype": info.doctype,
-            "duration_secs": info.duration_secs,
-            "width": info.width,
-            "height": info.height,
-            "video_codec": info.video_codec,
-            "audio_codec": info.audio_codec,
-            "framerate": info.framerate,
-            "container": info.container_name(),
-        })),
+        Ok(info) => {
+            let container = info.container_name();
+            match build_info(
+                &[
+                    ("doctype", info.doctype.as_str()),
+                    ("video_codec", info.video_codec.as_str()),
+                    ("container", container.as_str()),
+                ],
+                &[("audio_codec", info.audio_codec.as_deref())],
+                &[
+                    ("duration_secs", info.duration_secs),
+                    ("framerate", info.framerate),
+                ],
+                &[
+                    ("width", info.width as u64),
+                    ("height", info.height as u64),
+                ],
+            ) {
+                Some(s) => json_ptr_str(s),
+                None => {
+                    set_error(error_out, "non-finite metadata value");
+                    std::ptr::null_mut()
+                }
+            }
+        }
         Err(e) => {
             set_error(error_out, &e.to_string());
             std::ptr::null_mut()
@@ -384,15 +458,30 @@ pub extern "C" fn tontoo_mediakit_avi_info(
         return std::ptr::null_mut();
     };
     match crate::read_avi_info(Path::new(&path)) {
-        Ok(info) => json_ptr(&json!({
-            "duration_secs": info.duration_secs,
-            "width": info.width,
-            "height": info.height,
-            "video_codec": info.video_fourcc,
-            "audio_codec": info.audio_codec,
-            "framerate": info.framerate,
-            "container": info.container_name(),
-        })),
+        Ok(info) => {
+            let container = info.container_name();
+            match build_info(
+                &[
+                    ("video_codec", info.video_fourcc.as_str()),
+                    ("container", container.as_str()),
+                ],
+                &[("audio_codec", info.audio_codec.as_deref())],
+                &[
+                    ("duration_secs", info.duration_secs),
+                    ("framerate", info.framerate),
+                ],
+                &[
+                    ("width", info.width as u64),
+                    ("height", info.height as u64),
+                ],
+            ) {
+                Some(s) => json_ptr_str(s),
+                None => {
+                    set_error(error_out, "non-finite metadata value");
+                    std::ptr::null_mut()
+                }
+            }
+        }
         Err(e) => {
             set_error(error_out, &e.to_string());
             std::ptr::null_mut()
@@ -415,5 +504,51 @@ pub extern "C" fn tontoo_mediakit_prores_profile(fourcc: *const c_char) -> i32 {
         crate::ProResProfile::FourFourFourFour => 5,
         crate::ProResProfile::FourFourFourFourXq => 6,
         crate::ProResProfile::Unknown => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_shapes_are_valid_json() {
+        let s = build_info(
+            &[("video_codec", "raw ")],
+            &[( "audio_codec", None)],
+            &[("duration_secs", 3.0), ("framerate", 10.0)],
+            &[("width", 320), ("height", 240)],
+        )
+        .unwrap();
+        let v = foundation::serialization::JsonValue::parse(&s).unwrap();
+        assert_eq!(
+            v.get("video_codec").and_then(|x| x.as_str()),
+            Some("raw ")
+        );
+        assert!(v.get("audio_codec").map(|x| x.is_null()).unwrap_or(false));
+        assert_eq!(v.get("width").and_then(|x| x.as_u64()), Some(320));
+    }
+
+    #[test]
+    fn info_rejects_non_finite() {
+        assert!(
+            build_info(
+                &[],
+                &[],
+                &[("duration_secs", f64::NAN)],
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn arrays_stringify() {
+        let items = vec![
+            JsonValue::Object(vec![("id".to_string(), JsonValue::Str("video0".into()))]),
+            JsonValue::Object(vec![("index".to_string(), JsonValue::Integer(2))]),
+        ];
+        let s = JsonValue::Array(items).stringify(false);
+        assert_eq!(s, r#"[{"id":"video0"},{"index":2}]"#);
     }
 }

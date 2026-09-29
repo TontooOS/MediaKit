@@ -1,6 +1,8 @@
 # Ffi
 
 C ABI (`tontoo_mediakit_*`) and JSON shapes for the SDK bridge.
+JSON is built with Foundation (`JsonObject`/`JsonValue`), no
+serde/serde_json anywhere in the crate.
 
 ## Transport
 

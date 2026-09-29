@@ -6,9 +6,8 @@
 //! player UIs can show loading spinners.
 
 use crate::error::{MediaError, Result};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamKind {
     #[default]
     Progressive,

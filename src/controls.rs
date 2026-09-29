@@ -7,8 +7,6 @@
 //! - Colors follow the TontooOS contract: Dark background `#1b2022` with
 //!   text `#d8d9d9`, Light background `#ffffff` with text `#272727`.
 
-use serde::{Deserialize, Serialize};
-
 /// TontooOS Dark mode background `#1b2022` (27, 32, 34).
 pub const DARK_BACKGROUND: (u8, u8, u8) = (0x1b, 0x20, 0x22);
 /// TontooOS Dark mode text `#d8d9d9` (216, 217, 217).
@@ -24,7 +22,7 @@ pub fn sf_pro_family() -> &'static str {
 }
 
 /// SF Symbol names for every player control (resolved via CoreIcon).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlIcon {
     Play,
     Pause,
@@ -69,7 +67,7 @@ impl ControlIcon {
 }
 
 /// One control row entry (icon + localized label + SF Pro style).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ControlDescriptor {
     pub icon: ControlIcon,
     pub label_key: &'static str,
