@@ -12,8 +12,9 @@ for cam in &cameras {
 }
 ```
 
-- Reads `/sys/class/video4linux` first (no binary needed).
-- Falls back to `v4l2-ctl --list-devices`.
+- Reads `/sys/class/video4linux` first (friendly labels).
+- Falls back to a direct `/dev/video0..63` scan (containers
+  without sysfs). No external tools.
 - Returns an empty list on headless machines, never an error for that
   case.
 

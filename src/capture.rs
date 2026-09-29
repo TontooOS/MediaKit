@@ -9,7 +9,6 @@
 use crate::error::{MediaError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraDevice {
@@ -58,10 +57,14 @@ impl CaptureQuality {
 }
 
 /// Lists `/dev/video*` capture devices.
+///
+/// sysfs (`/sys/class/video4linux`) first for friendly labels, then a
+/// direct `/dev/video0..63` scan so containers without sysfs still
+/// work. No external tools.
 pub fn list_cameras() -> Result<Vec<CameraDevice>> {
     let mut devices = list_from_sysfs();
     if devices.is_empty() {
-        devices = list_from_v4l2_ctl().unwrap_or_default();
+        devices = list_from_dev_scan();
     }
     Ok(devices)
 }
@@ -94,42 +97,29 @@ fn list_from_sysfs() -> Vec<CameraDevice> {
     out
 }
 
-fn list_from_v4l2_ctl() -> Result<Vec<CameraDevice>> {
-    let out = Command::new("v4l2-ctl")
-        .args(["--list-devices"])
-        .output()
-        .map_err(MediaError::from_io)?;
-    if !out.status.success() {
-        return Ok(Vec::new());
-    }
-    Ok(parse_v4l2_list(&String::from_utf8_lossy(&out.stdout)))
-}
-
-fn parse_v4l2_list(text: &str) -> Vec<CameraDevice> {
-    let mut devices = Vec::new();
-    let mut current_label = String::new();
-    for line in text.lines() {
-        if line.starts_with('\t') || line.starts_with(' ') {
-            let node = line.trim().to_string();
-            if node.starts_with("/dev/video") {
-                let id = node.trim_start_matches("/dev/").to_string();
-                let kind = classify_label(&current_label);
-                devices.push(CameraDevice {
-                    id: id.clone(),
-                    label: if current_label.is_empty() {
-                        id.clone()
-                    } else {
-                        format!("{current_label} ({id})")
-                    },
-                    node: PathBuf::from(node),
-                    kind,
-                });
-            }
-        } else if !line.trim().is_empty() {
-            current_label = line.trim().trim_end_matches(':').to_string();
+/// Direct `/dev/video0..63` scan (no sysfs, no tools).
+/// Labels come from sysfs when readable, else fall back to the id.
+fn list_from_dev_scan() -> Vec<CameraDevice> {
+    let mut out = Vec::new();
+    for i in 0..64 {
+        let id = format!("video{i}");
+        let node = PathBuf::from(format!("/dev/{id}"));
+        if !node.exists() {
+            continue;
         }
+        let label = std::fs::read_to_string(format!("/sys/class/video4linux/{id}/name"))
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| id.clone());
+        out.push(CameraDevice {
+            id: id.clone(),
+            kind: classify_label(&label),
+            label,
+            node,
+        });
     }
-    devices
+    out
 }
 
 fn classify_label(label: &str) -> CameraKind {
@@ -179,11 +169,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_v4l2_devices() {
-        let text = "HD Pro Webcam C920:\n\t/dev/video0\n\t/dev/video1\n";
-        let devices = parse_v4l2_list(text);
-        assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].node, PathBuf::from("/dev/video0"));
+    fn dev_scan_never_panics_headless() {
+        // No /dev/video* on CI: empty list, no error, no tools.
+        let _ = list_from_dev_scan();
+        let _ = list_cameras();
     }
 
     #[test]
