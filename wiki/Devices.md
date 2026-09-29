@@ -8,8 +8,8 @@ Available cameras/capture devices and video outputs.
 let cameras = mediakit::available_cameras()?;
 ```
 
-- Delegates to `capture::list_cameras` (`/sys/class/video4linux` with
-  `v4l2-ctl` fallback).
+- Delegates to `capture::list_cameras` (sysfs plus direct
+  `/dev/video` scan, no tools).
 - See [Capture.md](Capture.md) for the `CameraDevice` shape.
 
 ## Outputs
@@ -21,8 +21,9 @@ for out in &outputs {
 }
 ```
 
-- Probes `swaymsg -t get_outputs` (TontooCompositor/Wayland) first.
-- Falls back to `xrandr --query`.
+- Enumerates DRM/KMS connectors on Linux (`/dev/dri/card*`,
+  no tools); empty elsewhere.
+- Picks the preferred mode, else the largest, per connector.
 - Returns an empty list on headless machines instead of an error.
 
 ### `VideoOutput`
@@ -45,5 +46,5 @@ println!("{} cameras, {} outputs", cameras.len(), outputs.len());
 
 ## Cross References
 
-- [Capture.md](Capture.md) – recording on these cameras
+- [Capture.md](Capture.md) – stills on these cameras
 - [Playback.md](Playback.md) – fullscreen target outputs
